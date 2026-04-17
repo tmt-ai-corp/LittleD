@@ -249,6 +249,11 @@ def unwrap_model(model):
     return model.module if isinstance(model, DDP) else model
 
 
+def move_model_to_local_cuda(model):
+    local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    return model.to(device=local_device, dtype=torch.bfloat16)
+
+
 def build_models(
     args,
     resume_checkpoint: Optional[str],
@@ -282,7 +287,7 @@ def build_models(
             setattr(args, key.replace("-", "_"), value)
         student_model = load_quantized_dflash_model(
             resume_checkpoint,
-            device="cuda",
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             torch_dtype=torch.bfloat16,
             quant_args=args,
         )
@@ -293,6 +298,7 @@ def build_models(
             trust_remote_code=args.trust_remote_code,
         ).cuda()
         student_model = apply_littlebit_patch(student_model, args, do_train=True)
+        student_model = move_model_to_local_cuda(student_model)
 
     student_model.config._attn_implementation = args.attention_backend
     student_model.train()

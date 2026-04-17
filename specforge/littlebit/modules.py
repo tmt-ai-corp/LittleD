@@ -32,19 +32,35 @@ class LittleBitLinear(nn.Module):
             split_calc_float, split_dim, min_split_dim
         )
         eff_bit_actual = self._compute_eff_bits(a, b, final_split_dim, residual)
+        buffer_device = self._get_buffer_device()
 
         self.register_buffer(
             "_eff_bit_target",
-            torch.tensor(-1.0 if eff_bit is None else float(eff_bit)),
+            torch.tensor(
+                -1.0 if eff_bit is None else float(eff_bit), device=buffer_device
+            ),
         )
-        self.register_buffer("_split_dim_final", torch.tensor(final_split_dim))
-        self.register_buffer("_eff_bit_actual", torch.tensor(eff_bit_actual))
+        self.register_buffer(
+            "_split_dim_final",
+            torch.tensor(final_split_dim, device=buffer_device),
+        )
+        self.register_buffer(
+            "_eff_bit_actual",
+            torch.tensor(eff_bit_actual, device=buffer_device),
+        )
         self.split_dim = final_split_dim
 
         if self.do_train and hasattr(self, "weight") and self.weight is not None:
             self._initialize_parameters()
         else:
             self._initialize_empty_parameters()
+
+    def _get_buffer_device(self):
+        if hasattr(self, "weight") and self.weight is not None:
+            return self.weight.device
+        if self.bias is not None:
+            return self.bias.device
+        return torch.device("cpu")
 
     @staticmethod
     def _estimate_split_dim(a, b, eff_bit_target, residual) -> float | None:
