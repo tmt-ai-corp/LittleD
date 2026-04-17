@@ -1,6 +1,7 @@
 # coding=utf-8
-"""DFlash Training Wrapper."""
+"""DFlash training helpers and wrapper modules."""
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -91,6 +92,17 @@ def create_dflash_block_mask(
     return create_block_mask(
         dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
     )
+
+
+@dataclass
+class DFlashTrainingView:
+    anchor_positions: torch.Tensor
+    block_keep_mask: torch.Tensor
+    noise_embedding: torch.Tensor
+    position_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    target_ids: torch.Tensor
+    weight_mask: torch.Tensor
 
 
 class OnlineDFlashModel(nn.Module):
@@ -211,13 +223,56 @@ class OnlineDFlashModel(nn.Module):
 
         return self.embed_tokens(noise_ids)
 
-    def forward(
+    def _create_label_tensors(
         self,
         input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        block_keep_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Parallel block-wise training forward pass."""
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
+        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+        valid_label_mask = label_indices < seq_len
+        safe_label_indices = label_indices.clamp(max=seq_len - 1)
+
+        target_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            2,
+            safe_label_indices,
+        )
+
+        weight_mask = (
+            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+        )
+        weight_mask = weight_mask * valid_label_mask.float()
+
+        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        weight_mask = weight_mask * (pos_in_block > 0).float()
+
+        original_loss_mask_gathered = torch.gather(
+            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+            2,
+            safe_label_indices,
+        )
+        weight_mask = weight_mask * original_loss_mask_gathered
+
+        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
+            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            decay_weights = torch.exp(
+                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
+            )
+            weight_mask = weight_mask * decay_weights
+
+        return target_ids, weight_mask
+
+    def prepare_training_view(
+        self,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> DFlashTrainingView:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -252,67 +307,85 @@ class OnlineDFlashModel(nn.Module):
                 device=device,
             )
 
-        output_hidden = self.draft_model(
-            position_ids=full_position_ids,
-            noise_embedding=noise_embedding,
-            target_hidden=hidden_states,
-            attention_mask=dflash_attn_mask,
+        target_ids, weight_mask = self._create_label_tensors(
+            input_ids=input_ids,
+            loss_mask=loss_mask,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
         )
+
+        return DFlashTrainingView(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            noise_embedding=noise_embedding,
+            position_ids=full_position_ids,
+            attention_mask=dflash_attn_mask,
+            target_ids=target_ids,
+            weight_mask=weight_mask,
+        )
+
+    def forward_from_view(
+        self,
+        hidden_states: torch.Tensor,
+        training_view: DFlashTrainingView,
+        draft_model: Optional[DFlashDraftModel] = None,
+        output_hidden_states: bool = False,
+    ):
+        draft_model = draft_model or self.draft_model
+        model_outputs = draft_model(
+            position_ids=training_view.position_ids,
+            noise_embedding=training_view.noise_embedding,
+            target_hidden=hidden_states,
+            attention_mask=training_view.attention_mask,
+            output_hidden_states=output_hidden_states,
+        )
+
+        if output_hidden_states:
+            output_hidden, hidden_states_list = model_outputs
+        else:
+            output_hidden = model_outputs
+            hidden_states_list = None
 
         logits = self.lm_head(output_hidden)
+        if output_hidden_states:
+            return logits, hidden_states_list
+        return logits
 
-        # --- Labels: same-position prediction (position k predicts token anchor+k) ---
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_label_indices = label_indices.clamp(max=seq_len - 1)
-
-        target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
-            2,
-            safe_label_indices,
-        )
-
-        # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
-        weight_mask = (
-            block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
-        )
-        weight_mask = weight_mask * valid_label_mask.float()
-
-        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        weight_mask = weight_mask * (pos_in_block > 0).float()
-
-        original_loss_mask_gathered = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
-            2,
-            safe_label_indices,
-        )
-        weight_mask = weight_mask * original_loss_mask_gathered
-
-        binary_eval_mask = weight_mask.view(-1)
-
-        # --- Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0 ---
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            k = torch.arange(self.block_size, device=device).view(1, 1, -1)
-            decay_weights = torch.exp(
-                -(k - 1).clamp(min=0).float() / self.loss_decay_gamma
-            )
-            weight_mask = weight_mask * decay_weights
-
-        # --- Cross entropy ---
+    def compute_loss_and_accuracy(
+        self,
+        logits: torch.Tensor,
+        training_view: DFlashTrainingView,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         flat_logits = logits.view(-1, logits.size(-1))
-        flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
+        flat_targets = training_view.target_ids.view(-1)
+        flat_weights = training_view.weight_mask.view(-1)
+        binary_eval_mask = flat_weights > 0.0
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         valid_token_count = flat_weights.sum() + 1e-6
         loss = (loss_per_token * flat_weights).sum() / valid_token_count
 
-        # --- Accuracy ---
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
+            correct = (pred_ids == flat_targets) & binary_eval_mask
             actual_token_count = binary_eval_mask.sum() + 1e-6
             accuracy = correct.sum().float() / actual_token_count
 
         return loss, accuracy
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Parallel block-wise training forward pass."""
+        training_view = self.prepare_training_view(
+            input_ids=input_ids,
+            loss_mask=loss_mask,
+        )
+        logits = self.forward_from_view(
+            hidden_states=hidden_states,
+            training_view=training_view,
+        )
+        return self.compute_loss_and_accuracy(logits, training_view)

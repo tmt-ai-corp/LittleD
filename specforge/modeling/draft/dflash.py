@@ -247,11 +247,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        output_hidden_states: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        all_hidden_states = [] if output_hidden_states else None
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -263,7 +265,14 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        return self.norm(hidden_states)
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states.append(hidden_states)
+            return hidden_states, tuple(all_hidden_states)
+        return hidden_states
 
     @torch.inference_mode()
     def spec_generate(
@@ -273,6 +282,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        return_stats: bool = False,
     ):
         self.eval()
         num_input_tokens = input_ids.shape[1]
@@ -376,4 +386,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
 
-        return output_ids
+        if not return_stats:
+            return output_ids
+
+        num_new_tokens = max(output_ids.shape[1] - num_input_tokens, 0)
+        accept_length = (
+            sum(acceptance_lengths) / len(acceptance_lengths)
+            if acceptance_lengths
+            else 1.0
+        )
+        return output_ids, {
+            "acceptance_lengths": acceptance_lengths,
+            "num_new_tokens": num_new_tokens,
+            "num_speculation_steps": len(acceptance_lengths),
+            "accept_length": accept_length,
+        }

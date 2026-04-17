@@ -1,0 +1,221 @@
+import argparse
+import importlib
+import inspect
+import json
+import os
+import re
+import shutil
+from collections import defaultdict
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from safetensors import safe_open
+from transformers import AutoConfig
+
+from specforge.modeling.draft.dflash import DFlashDraftModel
+
+from .modules import LittleBitLinear
+from .packing import binary_unpacker
+
+__all__ = [
+    "apply_littlebit_patch",
+    "read_littlebit_config",
+    "save_quantized_dflash_model",
+    "load_quantized_dflash_model",
+]
+
+
+def load_quant_fn(name: str):
+    module = importlib.import_module("specforge.littlebit.functions")
+    try:
+        return getattr(module, name)
+    except AttributeError as exc:
+        raise ValueError(f"Unknown LittleBit quant function: {name}") from exc
+
+
+def apply_littlebit_patch(
+    model: nn.Module,
+    quant_args,
+    *,
+    do_train: bool,
+    exclude_names: list[str] | None = None,
+):
+    exclude_names = exclude_names or ["lm_head"]
+    quant_func = load_quant_fn(getattr(quant_args, "quant_func", "STEBinary"))
+    common_kwargs = {
+        "do_train": do_train,
+        "quant_func": quant_func,
+        "residual": getattr(quant_args, "residual", False),
+        "split_dim": getattr(quant_args, "split_dim", 1024),
+        "eff_bit": getattr(quant_args, "eff_bit", 1.0),
+        "min_split_dim": getattr(quant_args, "min_split_dim", 8),
+    }
+    kv_kwargs = {
+        "ratio_factor": getattr(quant_args, "kv_factor", 1.0),
+    }
+    kv_patterns = [re.compile(r"\.k_proj$"), re.compile(r"\.v_proj$")]
+
+    for name, module in model.named_modules():
+        if any(excluded in name for excluded in exclude_names):
+            continue
+        if not isinstance(module, nn.Linear):
+            continue
+
+        current_kwargs = dict(common_kwargs)
+        if any(pattern.search(name) for pattern in kv_patterns):
+            current_kwargs.update(kv_kwargs)
+
+        module.__class__ = LittleBitLinear
+        module.__quant_convert__(**current_kwargs)
+
+    return model
+
+
+def _load_raw_state_dict(model_path: str):
+    state_dict = {}
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    single_path = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as handle:
+            index = json.load(handle)
+        shard_files = set(index["weight_map"].values())
+        for shard_file in shard_files:
+            with safe_open(
+                os.path.join(model_path, shard_file), framework="pt", device="cpu"
+            ) as handle:
+                for key in handle.keys():
+                    state_dict[key] = handle.get_tensor(key)
+        return state_dict
+
+    if os.path.exists(single_path):
+        with safe_open(single_path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                state_dict[key] = handle.get_tensor(key)
+        return state_dict
+
+    bin_path = os.path.join(model_path, "pytorch_model.bin")
+    if os.path.exists(bin_path):
+        kwargs = {"map_location": "cpu"}
+        signature = inspect.signature(torch.load)
+        if "mmap" in signature.parameters:
+            kwargs["mmap"] = True
+        if "weights_only" in signature.parameters:
+            kwargs["weights_only"] = True
+        try:
+            return torch.load(bin_path, **kwargs)
+        except Exception:
+            kwargs["weights_only"] = False
+            return torch.load(bin_path, **kwargs)
+
+    raise FileNotFoundError(f"No model weights found in {model_path}")
+
+
+def _load_and_process_state_dict(model_path: str, torch_dtype: torch.dtype):
+    state_dict = _load_raw_state_dict(model_path)
+    has_packed_weights = any(key.endswith("_packed") for key in state_dict.keys())
+    if not has_packed_weights:
+        return state_dict, False
+
+    packed_components = defaultdict(dict)
+    final_state_dict = {}
+    pattern = re.compile(r"^(.*)\.([^.]+?)_(packed|shape)$")
+
+    for key, value in state_dict.items():
+        match = pattern.match(key)
+        if match:
+            prefix, param_name, suffix_type = match.groups()
+            packed_components[prefix][f"{param_name}_{suffix_type}"] = value
+        else:
+            final_state_dict[key] = value
+
+    for prefix, components in packed_components.items():
+        param_names = {
+            key.rsplit("_", 1)[0] for key in components if key.endswith("_packed")
+        }
+        for name in param_names:
+            packed_tensor = components.get(f"{name}_packed")
+            shape_tensor = components.get(f"{name}_shape")
+            if packed_tensor is None or shape_tensor is None:
+                continue
+            shape = tuple(shape_tensor.tolist())
+            unpacked = binary_unpacker(packed_tensor, shape).to(torch_dtype)
+            final_state_dict[f"{prefix}.{name}"] = unpacked
+
+    return final_state_dict, True
+
+
+def read_littlebit_config(model_path: str) -> dict:
+    config_path = Path(model_path) / "littlebit_config.json"
+    if not config_path.exists():
+        return {}
+    with open(config_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _quant_config_dict(quant_args) -> dict:
+    return {
+        "quant_func": getattr(quant_args, "quant_func", "STEBinary"),
+        "eff_bit": getattr(quant_args, "eff_bit", 1.0),
+        "split_dim": getattr(quant_args, "split_dim", 1024),
+        "residual": getattr(quant_args, "residual", False),
+        "kv_factor": getattr(quant_args, "kv_factor", 1.0),
+        "min_split_dim": getattr(quant_args, "min_split_dim", 8),
+    }
+
+
+def save_quantized_dflash_model(model: DFlashDraftModel, output_dir: str, quant_args):
+    os.makedirs(output_dir, exist_ok=True)
+    quant_config = _quant_config_dict(quant_args)
+    for key, value in quant_config.items():
+        setattr(model.config, key, value)
+    model.config.quant_method = "littlebit"
+    model.save_pretrained(output_dir)
+
+    with open(
+        os.path.join(output_dir, "littlebit_config.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(quant_config, handle, indent=2)
+
+    modeling_src = (
+        Path(__file__).resolve().parent.parent / "modeling" / "draft" / "dflash.py"
+    )
+    modeling_dst = Path(output_dir) / "dflash.py"
+    if modeling_src.exists():
+        shutil.copy(modeling_src, modeling_dst)
+
+
+def load_quantized_dflash_model(
+    model_path: str,
+    *,
+    device: str | torch.device = "cuda",
+    torch_dtype: torch.dtype = torch.bfloat16,
+    quant_args=None,
+):
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    if quant_args is None:
+        config_dict = read_littlebit_config(model_path)
+        quant_args = argparse.Namespace(**config_dict)
+
+    model = DFlashDraftModel(config)
+    model = apply_littlebit_patch(model, quant_args, do_train=False)
+
+    state_dict, was_packed = _load_and_process_state_dict(model_path, torch_dtype)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"WARNING: Missing keys when loading quantized DFlash: {missing[:10]}")
+    if unexpected:
+        print(
+            f"WARNING: Unexpected keys when loading quantized DFlash: {unexpected[:10]}"
+        )
+
+    if was_packed:
+        for module in model.modules():
+            if isinstance(module, LittleBitLinear):
+                module._binarized = True
+
+    if device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device=device, dtype=torch_dtype)
+    model.eval()
+    return model
