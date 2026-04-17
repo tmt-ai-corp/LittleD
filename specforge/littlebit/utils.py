@@ -191,6 +191,7 @@ def load_quantized_dflash_model(
     device: str | torch.device = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
     quant_args=None,
+    do_train: bool = False,
 ):
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     if quant_args is None:
@@ -198,7 +199,7 @@ def load_quantized_dflash_model(
         quant_args = argparse.Namespace(**config_dict)
 
     model = DFlashDraftModel(config)
-    model = apply_littlebit_patch(model, quant_args, do_train=False)
+    model = apply_littlebit_patch(model, quant_args, do_train=do_train)
 
     state_dict, was_packed = _load_and_process_state_dict(model_path, torch_dtype)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -217,5 +218,5 @@ def load_quantized_dflash_model(
     if device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device=device, dtype=torch_dtype)
-    model.eval()
+    model.train(do_train)
     return model

@@ -11,5 +11,6 @@ We use the ShareGPT dataset for all the examples for now, but you can replace it
 Additional DFlash + LittleBit examples:
 
 - `run_qwen3_4b_dflash_littlebit_qat.sh`: 4xH100-style QAT training entrypoint for `z-lab/Qwen3-4B-DFlash-b16`
+- `run_qwen3_4b_dflash_littlebit_v2.sh`: fallback QAT entrypoint that converts DFlash to LittleBit and trains with the original DFlash CE loss
 - `run_qwen3_4b_dflash_acceptance_smoke.sh`: small acceptance-length smoke run on `gsm8k/math500/mtbench`
 - `run_qwen3_4b_sd_compare.sh`: compare `AngelSlim/Qwen3-4B_eagle3` vs `z-lab/Qwen3-4B-DFlash-b16` vs a LittleBit-DFlash checkpoint

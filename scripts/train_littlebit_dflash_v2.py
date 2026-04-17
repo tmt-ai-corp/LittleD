@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # coding=utf-8
-"""Train a LittleBit-quantized DFlash model with QAKD."""
+"""Train a LittleBit-converted DFlash model with the original DFlash CE loss.
+
+This is a fallback QAT path:
+pretrained DFlash -> LittleBit DualSVD init -> DFlash CE training.
+It intentionally does not run QAKD, teacher DFlash, KL, or intermediate MSE.
+"""
 
 import argparse
 import hashlib
@@ -14,6 +19,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -23,9 +29,6 @@ from transformers import AutoTokenizer
 
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
-from specforge.core.littlebit_dflash import (
-    compute_littlebit_dflash_losses_from_hidden,
-)
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.littlebit import (
@@ -46,7 +49,9 @@ from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a LittleBit-DFlash model")
+    parser = argparse.ArgumentParser(
+        description="Train LittleBit-DFlash with the DFlash CE fallback loss"
+    )
 
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
@@ -54,7 +59,7 @@ def parse_args():
     model_group.add_argument(
         "--target-model-backend",
         type=str,
-        default="hf",
+        default="sglang",
         choices=["sglang", "hf"],
         help="Backend for target hidden-state generation.",
     )
@@ -65,43 +70,22 @@ def parse_args():
         choices=["eager", "sdpa", "flex_attention"],
         help="Attention backend used by the DFlash draft model.",
     )
-    model_group.add_argument(
-        "--mask-token-id",
-        type=int,
-        default=None,
-        help="Override MASK token id. Defaults to checkpoint/tokenizer value.",
-    )
-    model_group.add_argument(
-        "--num-anchors",
-        type=int,
-        default=512,
-        help="Number of anchor positions to sample per sequence.",
-    )
+    model_group.add_argument("--mask-token-id", type=int, default=None)
+    model_group.add_argument("--num-anchors", type=int, default=512)
     model_group.add_argument(
         "--fixed-num-anchors",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Keep DFlash draft-token shape fixed at num_anchors * block_size. "
-        "This avoids FlexAttention recompilation and DDP stragglers on variable-length batches.",
+        help="Keep draft-token shape fixed at num_anchors * block_size.",
     )
     model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
-        default=None,
-        help="Optional decay for DFlash token weights. This affects logged CE only.",
+        default=7.0,
+        help="DFlash token loss decay. Original DFlash examples use 7.0.",
     )
-    model_group.add_argument(
-        "--embedding-key",
-        type=str,
-        default=None,
-        help="Embedding weight key in the target model.",
-    )
-    model_group.add_argument(
-        "--lm-head-key",
-        type=str,
-        default=None,
-        help="LM head weight key in the target model.",
-    )
+    model_group.add_argument("--embedding-key", type=str, default=None)
+    model_group.add_argument("--lm-head-key", type=str, default=None)
     model_group.add_argument("--trust-remote-code", action="store_true")
 
     dataset_group = parser.add_argument_group("dataset")
@@ -118,7 +102,7 @@ def parse_args():
 
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=3)
-    training_group.add_argument("--batch-size", type=int, default=1)
+    training_group.add_argument("--batch-size", type=int, default=2)
     training_group.add_argument("--learning-rate", type=float, default=2e-5)
     training_group.add_argument("--max-length", type=int, default=3072)
     training_group.add_argument(
@@ -132,38 +116,16 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--max-num-steps", type=int, default=None)
-    training_group.add_argument(
-        "--l2l-loss-scale",
-        type=float,
-        default=10.0,
-        help="Intermediate hidden-state MSE scale, following LittleBit.",
-    )
-    training_group.add_argument(
-        "--kd-loss-scale",
-        type=float,
-        default=1.0,
-        help="Final-logit KL scale.",
-    )
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument("--resume-from-checkpoint", type=str, default=None)
     training_group.add_argument(
         "--logit-chunk-size",
         type=int,
         default=512,
-        help="Token chunk size for lm_head/KL/CE calculation. "
-        "Smaller values reduce peak memory for large num_anchors.",
+        help="Token chunk size for lm_head/CE. This preserves DFlash CE loss.",
     )
-    training_group.add_argument(
-        "--debug-step-timing",
-        action="store_true",
-        help="Print per-rank timings around each expensive training phase.",
-    )
-    training_group.add_argument(
-        "--debug-step-interval",
-        type=int,
-        default=1,
-        help="Print debug timings every N global steps when debug-step-timing is enabled.",
-    )
+    training_group.add_argument("--debug-step-timing", action="store_true")
+    training_group.add_argument("--debug-step-interval", type=int, default=1)
 
     quant_group = parser.add_argument_group("littlebit")
     quant_group.add_argument("--quant-func", type=str, default="STEBinary")
@@ -176,17 +138,12 @@ def parse_args():
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
     output_group.add_argument("--cache-dir", type=str, default="./cache")
-    output_group.add_argument("--log-interval", type=int, default=50)
+    output_group.add_argument("--log-interval", type=int, default=20)
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
 
     optimization_group = parser.add_argument_group("optimization")
-    optimization_group.add_argument(
-        "--tp-size",
-        type=int,
-        default=1,
-        help="Tensor parallelism used by the target backend.",
-    )
+    optimization_group.add_argument("--tp-size", type=int, default=1)
 
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
@@ -292,7 +249,7 @@ def pad_2d_to_length(tensor: torch.Tensor, target_length: int) -> torch.Tensor:
         return tensor
     if tensor.size(1) > target_length:
         return tensor[:, :target_length].contiguous()
-    return torch.nn.functional.pad(tensor, (0, target_length - tensor.size(1)))
+    return F.pad(tensor, (0, target_length - tensor.size(1)))
 
 
 def prepare_cuda_batch(data, args):
@@ -342,7 +299,7 @@ class StepTimer:
 def build_models(
     args,
     resume_checkpoint: Optional[str],
-) -> Tuple[DFlashTargetModel, DFlashDraftModel, torch.nn.Module]:
+) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     target_model_kwargs = {}
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
@@ -355,16 +312,6 @@ def build_models(
         trust_remote_code=args.trust_remote_code,
         **target_model_kwargs,
     )
-
-    teacher_model = DFlashDraftModel.from_pretrained(
-        args.draft_model_path,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=args.trust_remote_code,
-    ).cuda()
-    teacher_model.config._attn_implementation = args.attention_backend
-    teacher_model.eval()
-    for param in teacher_model.parameters():
-        param.requires_grad = False
 
     if resume_checkpoint:
         resume_quant_config = read_littlebit_config(resume_checkpoint)
@@ -388,21 +335,15 @@ def build_models(
 
     student_model.config._attn_implementation = args.attention_backend
     student_model.train()
-    return target_model, teacher_model, student_model
+    target_model.set_capture_layers(student_model.target_layer_ids)
+    return target_model, student_model
 
 
-def save_checkpoint(
-    args,
-    epoch: int,
-    step: int,
-    student_model,
-    optimizer: BF16Optimizer,
-):
+def save_checkpoint(args, epoch: int, step: int, student_model, optimizer):
     save_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
-        student_to_save = unwrap_model(student_model)
-        save_quantized_dflash_model(student_to_save, save_dir, args)
+        save_quantized_dflash_model(unwrap_model(student_model), save_dir, args)
         torch.save(
             {
                 "epoch": epoch,
@@ -416,12 +357,72 @@ def save_checkpoint(
     dist.barrier()
 
 
+def build_dflash_helper(args, student_model, target_components, mask_token_id):
+    student_unwrapped = unwrap_model(student_model)
+    return OnlineDFlashModel(
+        draft_model=student_unwrapped,
+        target_lm_head=target_components.lm_head,
+        target_embed_tokens=target_components.embed_tokens,
+        block_size=student_unwrapped.block_size,
+        mask_token_id=mask_token_id,
+        attention_backend=args.attention_backend,
+        num_anchors=args.num_anchors,
+        fixed_num_anchors=args.fixed_num_anchors,
+        loss_decay_gamma=args.loss_decay_gamma,
+    )
+
+
+def compute_dflash_ce_from_batch(
+    *,
+    args,
+    target_model,
+    dflash_helper,
+    student_model,
+    input_ids,
+    attention_mask,
+    loss_mask,
+    timer: Optional[StepTimer] = None,
+):
+    timer = timer or StepTimer(argparse.Namespace(debug_step_timing=False), 0)
+
+    timer.start("target_forward")
+    target_output = target_model.generate_dflash_data(
+        input_ids, attention_mask, loss_mask
+    )
+    hidden_states = target_output.hidden_states.cuda()
+    timer.end()
+
+    timer.start("prepare_training_view")
+    training_view = dflash_helper.prepare_training_view(
+        input_ids=input_ids,
+        loss_mask=loss_mask,
+    )
+    timer.end()
+
+    timer.start("student_draft_forward")
+    student_output_hidden = dflash_helper.forward_hidden_from_view(
+        hidden_states=hidden_states,
+        training_view=training_view,
+        draft_model=student_model,
+        output_hidden_states=False,
+    )
+    timer.end()
+
+    timer.start("loss")
+    loss, accuracy = dflash_helper.compute_loss_and_accuracy_from_hidden(
+        student_output_hidden,
+        training_view,
+        chunk_size=args.logit_chunk_size,
+    )
+    timer.end()
+    return loss, accuracy
+
+
 def evaluate(
     eval_dataloader,
     *,
     target_model,
     dflash_helper,
-    teacher_model,
     student_model,
     args,
     global_step,
@@ -431,78 +432,37 @@ def evaluate(
         return
 
     unwrap_model(student_model).eval()
-    metrics = {
-        "eval/loss": 0.0,
-        "eval/kd_loss": 0.0,
-        "eval/l2l_loss": 0.0,
-        "eval/task_loss": 0.0,
-        "eval/task_accuracy": 0.0,
-    }
+    loss_sum = 0.0
+    acc_sum = 0.0
     num_batches = 0
 
     with torch.no_grad():
         for data in eval_dataloader:
             input_ids, attention_mask, loss_mask = prepare_cuda_batch(data, args)
-            target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
-            )
-            hidden_states = target_output.hidden_states.cuda()
-            training_view = dflash_helper.prepare_training_view(
+            loss, accuracy = compute_dflash_ce_from_batch(
+                args=args,
+                target_model=target_model,
+                dflash_helper=dflash_helper,
+                student_model=student_model,
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 loss_mask=loss_mask,
             )
-
-            teacher_output_hidden, teacher_hidden_states = (
-                dflash_helper.forward_hidden_from_view(
-                    hidden_states=hidden_states,
-                    training_view=training_view,
-                    draft_model=teacher_model,
-                    output_hidden_states=True,
-                )
-            )
-            student_output_hidden, student_hidden_states = (
-                dflash_helper.forward_hidden_from_view(
-                    hidden_states=hidden_states,
-                    training_view=training_view,
-                    draft_model=student_model,
-                    output_hidden_states=True,
-                )
-            )
-            losses = compute_littlebit_dflash_losses_from_hidden(
-                student_output_hidden=student_output_hidden,
-                teacher_output_hidden=teacher_output_hidden,
-                student_hidden_states=student_hidden_states,
-                teacher_hidden_states=teacher_hidden_states,
-                lm_head=dflash_helper.lm_head,
-                l2l_loss_scale=args.l2l_loss_scale,
-                kd_loss_scale=args.kd_loss_scale,
-                logit_chunk_size=args.logit_chunk_size,
-            )
-            task_loss, task_accuracy = dflash_helper.compute_loss_and_accuracy_from_hidden(
-                student_output_hidden,
-                training_view,
-                chunk_size=args.logit_chunk_size,
-            )
-
-            metrics["eval/loss"] += sync_scalar(losses.loss)
-            metrics["eval/kd_loss"] += sync_scalar(losses.kd_loss)
-            metrics["eval/l2l_loss"] += sync_scalar(losses.l2l_loss)
-            metrics["eval/task_loss"] += sync_scalar(task_loss)
-            metrics["eval/task_accuracy"] += sync_scalar(task_accuracy)
+            loss_sum += sync_scalar(loss)
+            acc_sum += sync_scalar(accuracy)
             num_batches += 1
 
     if num_batches > 0:
-        for key in metrics:
-            metrics[key] /= num_batches
+        metrics = {
+            "eval/loss": loss_sum / num_batches,
+            "eval/accuracy": acc_sum / num_batches,
+        }
         tracker.log(metrics, step=global_step)
         print_on_rank0(
             "Eval - "
             f"Step {global_step}, "
             f"Loss: {metrics['eval/loss']:.4f}, "
-            f"KD: {metrics['eval/kd_loss']:.4f}, "
-            f"MSE: {metrics['eval/l2l_loss']:.4f}, "
-            f"TaskLoss: {metrics['eval/task_loss']:.4f}, "
-            f"TaskAcc: {metrics['eval/task_accuracy']:.4f}"
+            f"Acc: {metrics['eval/accuracy']:.4f}"
         )
 
     unwrap_model(student_model).train()
@@ -530,10 +490,7 @@ def main():
         print_on_rank0(f"Resuming from checkpoint: {resume_checkpoint}")
 
     try:
-        target_model, teacher_model, student_model = build_models(
-            args, resume_checkpoint
-        )
-        target_model.set_capture_layers(teacher_model.target_layer_ids)
+        target_model, student_model = build_models(args, resume_checkpoint)
 
         if dist.get_world_size() > 1:
             student_model = DDP(
@@ -548,11 +505,12 @@ def main():
             trust_remote_code=args.trust_remote_code,
         )
 
-        checkpoint_config = unwrap_model(student_model).config
+        student_unwrapped = unwrap_model(student_model)
+        checkpoint_config = student_unwrapped.config
         mask_token_id = (
             args.mask_token_id
             if args.mask_token_id is not None
-            else getattr(unwrap_model(student_model), "mask_token_id", None)
+            else getattr(student_unwrapped, "mask_token_id", None)
         )
         if mask_token_id is None:
             dflash_config = getattr(checkpoint_config, "dflash_config", {}) or {}
@@ -562,15 +520,15 @@ def main():
         if mask_token_id is None:
             tokenizer.add_special_tokens({"mask_token": "<|MASK|>"})
             mask_token_id = tokenizer.mask_token_id
-        student_unwrapped = unwrap_model(student_model)
+
         student_unwrapped.mask_token_id = mask_token_id
-        teacher_model.mask_token_id = mask_token_id
         student_dflash_config = (
             getattr(student_unwrapped.config, "dflash_config", {}) or {}
         )
         student_dflash_config["mask_token_id"] = mask_token_id
-        student_dflash_config["target_layer_ids"] = teacher_model.target_layer_ids
+        student_dflash_config["target_layer_ids"] = student_unwrapped.target_layer_ids
         student_unwrapped.config.dflash_config = student_dflash_config
+        print_on_rank0(f"dflash_config: {student_dflash_config}")
 
         train_dataloader, eval_dataloader = build_dataloader(
             args, tokenizer, student_unwrapped.block_size
@@ -588,17 +546,8 @@ def main():
             device="cuda",
             trust_remote_code=args.trust_remote_code,
         )
-
-        dflash_helper = OnlineDFlashModel(
-            draft_model=student_unwrapped,
-            target_lm_head=target_components.lm_head,
-            target_embed_tokens=target_components.embed_tokens,
-            block_size=student_unwrapped.block_size,
-            mask_token_id=mask_token_id,
-            attention_backend=args.attention_backend,
-            num_anchors=args.num_anchors,
-            fixed_num_anchors=args.fixed_num_anchors,
-            loss_decay_gamma=args.loss_decay_gamma,
+        dflash_helper = build_dflash_helper(
+            args, student_model, target_components, mask_token_id
         )
 
         optimizer = BF16Optimizer(
@@ -637,7 +586,7 @@ def main():
 
             if dist.get_rank() == 0:
                 progress_bar = tqdm(
-                    train_dataloader, desc=f"QAT Epoch {epoch}", leave=True
+                    train_dataloader, desc=f"LittleBit DFlash CE Epoch {epoch}", leave=True
                 )
             else:
                 progress_bar = train_dataloader
@@ -656,20 +605,6 @@ def main():
                 input_ids, attention_mask, loss_mask = prepare_cuda_batch(data, args)
                 timer.end()
 
-                timer.start("target_forward")
-                target_output = target_model.generate_dflash_data(
-                    input_ids, attention_mask, loss_mask
-                )
-                hidden_states = target_output.hidden_states.cuda()
-                timer.end()
-
-                timer.start("prepare_training_view")
-                training_view = dflash_helper.prepare_training_view(
-                    input_ids=input_ids,
-                    loss_mask=loss_mask,
-                )
-                timer.end()
-
                 no_sync_context = (
                     student_model.no_sync()
                     if isinstance(student_model, DDP)
@@ -677,48 +612,18 @@ def main():
                     else nullcontext()
                 )
                 with no_sync_context:
-                    timer.start("teacher_draft_forward")
-                    with torch.no_grad():
-                        teacher_output_hidden, teacher_hidden_states = (
-                            dflash_helper.forward_hidden_from_view(
-                                hidden_states=hidden_states,
-                                training_view=training_view,
-                                draft_model=teacher_model,
-                                output_hidden_states=True,
-                            )
-                        )
-                    timer.end()
-
-                    timer.start("student_draft_forward")
-                    student_output_hidden, student_hidden_states = (
-                        dflash_helper.forward_hidden_from_view(
-                            hidden_states=hidden_states,
-                            training_view=training_view,
-                            draft_model=student_model,
-                            output_hidden_states=True,
-                        )
+                    loss, accuracy = compute_dflash_ce_from_batch(
+                        args=args,
+                        target_model=target_model,
+                        dflash_helper=dflash_helper,
+                        student_model=student_model,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        loss_mask=loss_mask,
+                        timer=timer,
                     )
-                    timer.end()
-
-                    timer.start("loss_and_backward")
-                    losses = compute_littlebit_dflash_losses_from_hidden(
-                        student_output_hidden=student_output_hidden,
-                        teacher_output_hidden=teacher_output_hidden,
-                        student_hidden_states=student_hidden_states,
-                        teacher_hidden_states=teacher_hidden_states,
-                        lm_head=dflash_helper.lm_head,
-                        l2l_loss_scale=args.l2l_loss_scale,
-                        kd_loss_scale=args.kd_loss_scale,
-                        logit_chunk_size=args.logit_chunk_size,
-                    )
-                    task_loss, task_accuracy = (
-                        dflash_helper.compute_loss_and_accuracy_from_hidden(
-                            student_output_hidden,
-                            training_view,
-                            chunk_size=args.logit_chunk_size,
-                        )
-                    )
-                    (losses.loss / args.accumulation_steps).backward()
+                    timer.start("backward")
+                    (loss / args.accumulation_steps).backward()
                     timer.end()
 
                 if global_step % args.accumulation_steps == 0:
@@ -730,11 +635,8 @@ def main():
                     current_time = time.time()
                     logdict = {
                         "train/lr": optimizer.get_learning_rate(),
-                        "train/loss": sync_scalar(losses.loss),
-                        "train/kd_loss": sync_scalar(losses.kd_loss),
-                        "train/l2l_loss": sync_scalar(losses.l2l_loss),
-                        "train/task_loss": sync_scalar(task_loss),
-                        "train/task_accuracy": sync_scalar(task_accuracy),
+                        "train/loss": sync_scalar(loss),
+                        "train/accuracy": sync_scalar(accuracy),
                         "train/step_time": current_time - last_time,
                     }
                     tracker.log(logdict, step=global_step)
@@ -742,13 +644,18 @@ def main():
                         "Train - "
                         f"Step {global_step}, "
                         f"Loss: {logdict['train/loss']:.4f}, "
-                        f"KD: {logdict['train/kd_loss']:.4f}, "
-                        f"MSE: {logdict['train/l2l_loss']:.4f}, "
-                        f"TaskLoss: {logdict['train/task_loss']:.4f}, "
-                        f"TaskAcc: {logdict['train/task_accuracy']:.4f}, "
+                        f"Acc: {logdict['train/accuracy']:.4f}, "
                         f"LR: {logdict['train/lr']:.6f}"
                     )
                     last_time = current_time
+
+                if dist.get_rank() == 0 and hasattr(progress_bar, "set_postfix"):
+                    progress_bar.set_postfix(
+                        {
+                            "loss": f"{loss.item():.4f}",
+                            "acc": f"{accuracy.item():.4f}",
+                        }
+                    )
 
                 if (
                     eval_dataloader is not None
@@ -759,7 +666,6 @@ def main():
                         eval_dataloader,
                         target_model=target_model,
                         dflash_helper=dflash_helper,
-                        teacher_model=teacher_model,
                         student_model=student_model,
                         args=args,
                         global_step=global_step,
