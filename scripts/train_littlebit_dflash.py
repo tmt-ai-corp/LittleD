@@ -23,7 +23,9 @@ from transformers import AutoTokenizer
 
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
-from specforge.core.littlebit_dflash import compute_littlebit_dflash_losses
+from specforge.core.littlebit_dflash import (
+    compute_littlebit_dflash_losses_from_hidden,
+)
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.littlebit import (
@@ -76,6 +78,13 @@ def parse_args():
         help="Number of anchor positions to sample per sequence.",
     )
     model_group.add_argument(
+        "--fixed-num-anchors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep DFlash draft-token shape fixed at num_anchors * block_size. "
+        "This avoids FlexAttention recompilation and DDP stragglers on variable-length batches.",
+    )
+    model_group.add_argument(
         "--loss-decay-gamma",
         type=float,
         default=None,
@@ -112,6 +121,12 @@ def parse_args():
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=2e-5)
     training_group.add_argument("--max-length", type=int, default=3072)
+    training_group.add_argument(
+        "--pad-to-max-length",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pad every batch to max_length to reduce per-rank shape drift.",
+    )
     training_group.add_argument("--warmup-ratio", type=float, default=0.03)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
@@ -131,6 +146,24 @@ def parse_args():
     )
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument("--resume-from-checkpoint", type=str, default=None)
+    training_group.add_argument(
+        "--logit-chunk-size",
+        type=int,
+        default=512,
+        help="Token chunk size for lm_head/KL/CE calculation. "
+        "Smaller values reduce peak memory for large num_anchors.",
+    )
+    training_group.add_argument(
+        "--debug-step-timing",
+        action="store_true",
+        help="Print per-rank timings around each expensive training phase.",
+    )
+    training_group.add_argument(
+        "--debug-step-interval",
+        type=int,
+        default=1,
+        help="Print debug timings every N global steps when debug-step-timing is enabled.",
+    )
 
     quant_group = parser.add_argument_group("littlebit")
     quant_group.add_argument("--quant-func", type=str, default="STEBinary")
@@ -254,6 +287,58 @@ def move_model_to_local_cuda(model):
     return model.to(device=local_device, dtype=torch.bfloat16)
 
 
+def pad_2d_to_length(tensor: torch.Tensor, target_length: int) -> torch.Tensor:
+    if tensor.size(1) == target_length:
+        return tensor
+    if tensor.size(1) > target_length:
+        return tensor[:, :target_length].contiguous()
+    return torch.nn.functional.pad(tensor, (0, target_length - tensor.size(1)))
+
+
+def prepare_cuda_batch(data, args):
+    input_ids = data["input_ids"].cuda(non_blocking=True)
+    attention_mask = data["attention_mask"].cuda(non_blocking=True)
+    loss_mask = data["loss_mask"].cuda(non_blocking=True)
+
+    if args.pad_to_max_length:
+        input_ids = pad_2d_to_length(input_ids, args.max_length)
+        attention_mask = pad_2d_to_length(attention_mask, args.max_length)
+        loss_mask = pad_2d_to_length(loss_mask, args.max_length)
+
+    return input_ids, attention_mask, loss_mask
+
+
+class StepTimer:
+    def __init__(self, args, global_step: int):
+        self.enabled = (
+            args.debug_step_timing
+            and args.debug_step_interval > 0
+            and global_step % args.debug_step_interval == 0
+        )
+        self.global_step = global_step
+        self.phase = None
+        self.start_time = None
+
+    def start(self, phase: str):
+        if not self.enabled:
+            return
+        torch.cuda.synchronize()
+        self.phase = phase
+        self.start_time = time.time()
+        print_with_rank(f"Step {self.global_step}: begin {phase}")
+
+    def end(self):
+        if not self.enabled or self.phase is None:
+            return
+        torch.cuda.synchronize()
+        elapsed = time.time() - self.start_time
+        print_with_rank(
+            f"Step {self.global_step}: end {self.phase} ({elapsed:.3f}s)"
+        )
+        self.phase = None
+        self.start_time = None
+
+
 def build_models(
     args,
     resume_checkpoint: Optional[str],
@@ -356,9 +441,7 @@ def evaluate(
 
     with torch.no_grad():
         for data in eval_dataloader:
-            input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
+            input_ids, attention_mask, loss_mask = prepare_cuda_batch(data, args)
             target_output = target_model.generate_dflash_data(
                 input_ids, attention_mask, loss_mask
             )
@@ -368,28 +451,36 @@ def evaluate(
                 loss_mask=loss_mask,
             )
 
-            teacher_logits, teacher_hidden_states = dflash_helper.forward_from_view(
-                hidden_states=hidden_states,
-                training_view=training_view,
-                draft_model=teacher_model,
-                output_hidden_states=True,
+            teacher_output_hidden, teacher_hidden_states = (
+                dflash_helper.forward_hidden_from_view(
+                    hidden_states=hidden_states,
+                    training_view=training_view,
+                    draft_model=teacher_model,
+                    output_hidden_states=True,
+                )
             )
-            student_logits, student_hidden_states = dflash_helper.forward_from_view(
-                hidden_states=hidden_states,
-                training_view=training_view,
-                draft_model=student_model,
-                output_hidden_states=True,
+            student_output_hidden, student_hidden_states = (
+                dflash_helper.forward_hidden_from_view(
+                    hidden_states=hidden_states,
+                    training_view=training_view,
+                    draft_model=student_model,
+                    output_hidden_states=True,
+                )
             )
-            losses = compute_littlebit_dflash_losses(
-                student_logits=student_logits,
-                teacher_logits=teacher_logits,
+            losses = compute_littlebit_dflash_losses_from_hidden(
+                student_output_hidden=student_output_hidden,
+                teacher_output_hidden=teacher_output_hidden,
                 student_hidden_states=student_hidden_states,
                 teacher_hidden_states=teacher_hidden_states,
+                lm_head=dflash_helper.lm_head,
                 l2l_loss_scale=args.l2l_loss_scale,
                 kd_loss_scale=args.kd_loss_scale,
+                logit_chunk_size=args.logit_chunk_size,
             )
-            task_loss, task_accuracy = dflash_helper.compute_loss_and_accuracy(
-                student_logits, training_view
+            task_loss, task_accuracy = dflash_helper.compute_loss_and_accuracy_from_hidden(
+                student_output_hidden,
+                training_view,
+                chunk_size=args.logit_chunk_size,
             )
 
             metrics["eval/loss"] += sync_scalar(losses.loss)
@@ -505,6 +596,7 @@ def main():
             mask_token_id=mask_token_id,
             attention_backend=args.attention_backend,
             num_anchors=args.num_anchors,
+            fixed_num_anchors=args.fixed_num_anchors,
             loss_decay_gamma=args.loss_decay_gamma,
         )
 
@@ -557,17 +649,25 @@ def main():
                     break
 
                 global_step += 1
-                input_ids = data["input_ids"].cuda()
-                attention_mask = data["attention_mask"].cuda()
-                loss_mask = data["loss_mask"].cuda()
+                timer = StepTimer(args, global_step)
+
+                timer.start("batch_to_cuda")
+                input_ids, attention_mask, loss_mask = prepare_cuda_batch(data, args)
+                timer.end()
+
+                timer.start("target_forward")
                 target_output = target_model.generate_dflash_data(
                     input_ids, attention_mask, loss_mask
                 )
                 hidden_states = target_output.hidden_states.cuda()
+                timer.end()
+
+                timer.start("prepare_training_view")
                 training_view = dflash_helper.prepare_training_view(
                     input_ids=input_ids,
                     loss_mask=loss_mask,
                 )
+                timer.end()
 
                 no_sync_context = (
                     student_model.no_sync()
@@ -576,39 +676,54 @@ def main():
                     else nullcontext()
                 )
                 with no_sync_context:
+                    timer.start("teacher_draft_forward")
                     with torch.no_grad():
-                        teacher_logits, teacher_hidden_states = (
-                            dflash_helper.forward_from_view(
+                        teacher_output_hidden, teacher_hidden_states = (
+                            dflash_helper.forward_hidden_from_view(
                                 hidden_states=hidden_states,
                                 training_view=training_view,
                                 draft_model=teacher_model,
                                 output_hidden_states=True,
                             )
                         )
+                    timer.end()
 
-                    student_logits, student_hidden_states = (
-                        dflash_helper.forward_from_view(
+                    timer.start("student_draft_forward")
+                    student_output_hidden, student_hidden_states = (
+                        dflash_helper.forward_hidden_from_view(
                             hidden_states=hidden_states,
                             training_view=training_view,
                             draft_model=student_model,
                             output_hidden_states=True,
                         )
                     )
-                    losses = compute_littlebit_dflash_losses(
-                        student_logits=student_logits,
-                        teacher_logits=teacher_logits,
+                    timer.end()
+
+                    timer.start("loss_and_backward")
+                    losses = compute_littlebit_dflash_losses_from_hidden(
+                        student_output_hidden=student_output_hidden,
+                        teacher_output_hidden=teacher_output_hidden,
                         student_hidden_states=student_hidden_states,
                         teacher_hidden_states=teacher_hidden_states,
+                        lm_head=dflash_helper.lm_head,
                         l2l_loss_scale=args.l2l_loss_scale,
                         kd_loss_scale=args.kd_loss_scale,
+                        logit_chunk_size=args.logit_chunk_size,
                     )
-                    task_loss, task_accuracy = dflash_helper.compute_loss_and_accuracy(
-                        student_logits, training_view
+                    task_loss, task_accuracy = (
+                        dflash_helper.compute_loss_and_accuracy_from_hidden(
+                            student_output_hidden,
+                            training_view,
+                            chunk_size=args.logit_chunk_size,
+                        )
                     )
                     (losses.loss / args.accumulation_steps).backward()
+                    timer.end()
 
                 if global_step % args.accumulation_steps == 0:
+                    timer.start("optimizer_step")
                     optimizer.step()
+                    timer.end()
 
                 if global_step % args.log_interval == 0:
                     current_time = time.time()

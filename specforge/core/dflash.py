@@ -117,6 +117,7 @@ class OnlineDFlashModel(nn.Module):
         block_size: int = 16,
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
+        fixed_num_anchors: bool = False,
         loss_decay_gamma: Optional[float] = None,
     ):
         super().__init__()
@@ -127,6 +128,7 @@ class OnlineDFlashModel(nn.Module):
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
+        self.fixed_num_anchors = fixed_num_anchors
         self.loss_decay_gamma = loss_decay_gamma
 
         self._cached_block_mask: Optional[BlockMask] = None
@@ -143,9 +145,14 @@ class OnlineDFlashModel(nn.Module):
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
-        max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
+        max_valid_count = int(valid_counts.max().item())
+        max_n = (
+            self.num_anchors
+            if self.fixed_num_anchors
+            else min(self.num_anchors, max_valid_count - 1)
+        )
 
-        if max_n <= 0:
+        if max_n <= 0 or max_valid_count <= 1:
             raise ValueError("should preprocess the data.")
 
         indices = (
@@ -160,7 +167,16 @@ class OnlineDFlashModel(nn.Module):
 
         _, sorted_idx = random_vals.sort(dim=1)
         gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
+        selected = gathered[:, : min(max_n, gathered.size(1))]
+        if selected.size(1) < max_n:
+            pad = torch.full(
+                (bsz, max_n - selected.size(1)),
+                seq_len + 1,
+                dtype=selected.dtype,
+                device=device,
+            )
+            selected = torch.cat([selected, pad], dim=1)
+        anchors = selected.sort(dim=1).values
 
         keep_mask = torch.arange(max_n, device=device).unsqueeze(
             0
@@ -324,7 +340,7 @@ class OnlineDFlashModel(nn.Module):
             weight_mask=weight_mask,
         )
 
-    def forward_from_view(
+    def forward_hidden_from_view(
         self,
         hidden_states: torch.Tensor,
         training_view: DFlashTrainingView,
@@ -346,10 +362,74 @@ class OnlineDFlashModel(nn.Module):
             output_hidden = model_outputs
             hidden_states_list = None
 
+        if output_hidden_states:
+            return output_hidden, hidden_states_list
+        return output_hidden
+
+    def forward_from_view(
+        self,
+        hidden_states: torch.Tensor,
+        training_view: DFlashTrainingView,
+        draft_model: Optional[DFlashDraftModel] = None,
+        output_hidden_states: bool = False,
+    ):
+        model_outputs = self.forward_hidden_from_view(
+            hidden_states=hidden_states,
+            training_view=training_view,
+            draft_model=draft_model,
+            output_hidden_states=output_hidden_states,
+        )
+
+        if output_hidden_states:
+            output_hidden, hidden_states_list = model_outputs
+        else:
+            output_hidden = model_outputs
+            hidden_states_list = None
+
         logits = self.lm_head(output_hidden)
         if output_hidden_states:
             return logits, hidden_states_list
         return logits
+
+    def compute_loss_and_accuracy_from_hidden(
+        self,
+        output_hidden: torch.Tensor,
+        training_view: DFlashTrainingView,
+        *,
+        chunk_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        total_loss = output_hidden.new_zeros(())
+        total_correct = output_hidden.new_zeros(())
+        flat_targets = training_view.target_ids.reshape(output_hidden.shape[0], -1)
+        flat_weights = training_view.weight_mask.reshape(output_hidden.shape[0], -1)
+        valid_token_count = flat_weights.sum() + 1e-6
+        actual_token_count = (flat_weights > 0.0).sum() + 1e-6
+
+        seq_len = output_hidden.shape[1]
+        if chunk_size is None or chunk_size <= 0:
+            chunk_size = seq_len
+
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            logits = self.lm_head(output_hidden[:, start:end, :])
+            flat_logits = logits.reshape(-1, logits.size(-1))
+            target_chunk = flat_targets[:, start:end].reshape(-1)
+            weight_chunk = flat_weights[:, start:end].reshape(-1)
+            loss_per_token = F.cross_entropy(
+                flat_logits, target_chunk, reduction="none"
+            )
+            total_loss = total_loss + (loss_per_token * weight_chunk).sum()
+
+            with torch.no_grad():
+                pred_ids = torch.argmax(flat_logits, dim=-1)
+                binary_eval_mask = weight_chunk > 0.0
+                total_correct = total_correct + (
+                    (pred_ids == target_chunk) & binary_eval_mask
+                ).sum()
+
+        loss = total_loss / valid_token_count
+        accuracy = total_correct.float() / actual_token_count
+        return loss, accuracy
 
     def compute_loss_and_accuracy(
         self,

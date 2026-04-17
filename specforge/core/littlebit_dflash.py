@@ -22,6 +22,27 @@ def kd_loss_like_littlebit(
     return F.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
 
 
+def kd_loss_from_hidden_like_littlebit(
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    lm_head,
+    *,
+    chunk_size: int | None = None,
+) -> torch.Tensor:
+    seq_len = student_hidden.shape[1]
+    if chunk_size is None or chunk_size <= 0:
+        chunk_size = seq_len
+
+    loss = student_hidden.new_zeros(())
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        student_logits = lm_head(student_hidden[:, start:end, :])
+        with torch.no_grad():
+            teacher_logits = lm_head(teacher_hidden[:, start:end, :])
+        loss = loss + kd_loss_like_littlebit(student_logits, teacher_logits)
+    return loss
+
+
 def mse_loss_like_littlebit(
     student_hidden_states: Iterable[torch.Tensor],
     teacher_hidden_states: Iterable[torch.Tensor],
@@ -55,6 +76,35 @@ def compute_littlebit_dflash_losses(
     kd_loss_scale: float = 1.0,
 ) -> LittleBitDFlashLosses:
     kd_loss = kd_loss_scale * kd_loss_like_littlebit(student_logits, teacher_logits)
+    l2l_loss = mse_loss_like_littlebit(
+        student_hidden_states,
+        teacher_hidden_states,
+        l2l_loss_scale=l2l_loss_scale,
+    )
+    return LittleBitDFlashLosses(
+        loss=kd_loss + l2l_loss,
+        kd_loss=kd_loss,
+        l2l_loss=l2l_loss,
+    )
+
+
+def compute_littlebit_dflash_losses_from_hidden(
+    student_output_hidden: torch.Tensor,
+    teacher_output_hidden: torch.Tensor,
+    student_hidden_states: Iterable[torch.Tensor],
+    teacher_hidden_states: Iterable[torch.Tensor],
+    lm_head,
+    *,
+    l2l_loss_scale: float,
+    kd_loss_scale: float = 1.0,
+    logit_chunk_size: int | None = None,
+) -> LittleBitDFlashLosses:
+    kd_loss = kd_loss_scale * kd_loss_from_hidden_like_littlebit(
+        student_hidden=student_output_hidden,
+        teacher_hidden=teacher_output_hidden,
+        lm_head=lm_head,
+        chunk_size=logit_chunk_size,
+    )
     l2l_loss = mse_loss_like_littlebit(
         student_hidden_states,
         teacher_hidden_states,

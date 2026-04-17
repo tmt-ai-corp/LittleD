@@ -3,6 +3,7 @@ from .eagle3 import OnlineEagle3Model, QwenVLOnlineEagle3Model
 from .littlebit_dflash import (
     LittleBitDFlashLosses,
     compute_littlebit_dflash_losses,
+    compute_littlebit_dflash_losses_from_hidden,
 )
 
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "QwenVLOnlineEagle3Model",
     "LittleBitDFlashLosses",
     "compute_littlebit_dflash_losses",
+    "compute_littlebit_dflash_losses_from_hidden",
 ]
