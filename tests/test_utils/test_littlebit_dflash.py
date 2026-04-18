@@ -5,7 +5,12 @@ from specforge.core.littlebit_dflash import (
     compute_littlebit_dflash_losses,
     compute_littlebit_dflash_losses_from_hidden,
 )
-from specforge.modeling.draft.dflash import find_first_stop_sequence
+from specforge.modeling.draft.dflash import (
+    build_ddtree_tree,
+    compile_ddtree_tree,
+    find_first_stop_sequence,
+    follow_verified_tree,
+)
 from specforge.littlebit import apply_littlebit_patch
 from specforge.littlebit.packing import binary_packer, binary_unpacker
 from specforge.littlebit.utils import _load_state_dict_allow_meta
@@ -117,3 +122,74 @@ def test_find_first_stop_sequence():
     assert find_first_stop_sequence(token_ids, [[11, 12]]) == 1
     assert find_first_stop_sequence(token_ids, [[13], [11, 12]]) == 1
     assert find_first_stop_sequence(token_ids, [[99]]) is None
+
+
+def test_build_ddtree_tree_and_follow_verified_path():
+    logits = torch.full((3, 8), -10.0)
+    logits[0, 1] = 4.0
+    logits[0, 2] = 3.0
+    logits[1, 3] = 4.0
+    logits[1, 4] = 3.0
+    logits[2, 5] = 4.0
+
+    node_token_ids, node_depths, parents, child_maps, visibility = build_ddtree_tree(
+        logits,
+        budget=4,
+    )
+
+    assert node_token_ids.tolist() == [1, 3, 5, 2]
+    assert node_depths.tolist() == [1, 2, 3, 1]
+    assert parents == [-1, 0, 1, 2, 0]
+    assert visibility.shape == (5, 5)
+    assert visibility[3, [0, 1, 2, 3]].all()
+    assert not visibility[3, 4]
+
+    accepted_indices, next_token = follow_verified_tree(
+        child_maps,
+        torch.tensor([[1, 3, 5, 0, 0]]),
+    )
+
+    assert accepted_indices == [0, 1, 2, 3]
+    assert next_token == 0
+
+
+def test_compile_ddtree_tree_builds_ancestor_mask():
+    verify_input_ids_buffer = torch.empty((1, 5), dtype=torch.long)
+    verify_position_ids_buffer = torch.empty((1, 5), dtype=torch.long)
+    attention_mask_buffer = torch.zeros((1, 1, 5, 16), dtype=torch.float32)
+    tree_visibility_buffer = torch.empty((5, 5), dtype=torch.bool)
+    visibility = torch.tensor(
+        [
+            [True, False, False],
+            [True, True, False],
+            [True, False, True],
+        ],
+        dtype=torch.bool,
+    )
+
+    input_ids, position_ids, attention_mask, tree_start, tree_length = (
+        compile_ddtree_tree(
+            root_token_id=torch.tensor(10),
+            start=7,
+            node_token_ids=torch.tensor([11, 12]),
+            node_depths=torch.tensor([1, 1]),
+            visibility_cpu=visibility,
+            past_length=7,
+            dtype=torch.float32,
+            verify_input_ids_buffer=verify_input_ids_buffer,
+            verify_position_ids_buffer=verify_position_ids_buffer,
+            attention_mask_buffer=attention_mask_buffer,
+            tree_visibility_buffer=tree_visibility_buffer,
+            previous_tree_start=0,
+            previous_tree_length=0,
+        )
+    )
+
+    assert input_ids.tolist() == [[10, 11, 12]]
+    assert position_ids.tolist() == [[7, 8, 8]]
+    assert tree_start == 7
+    assert tree_length == 3
+    assert attention_mask.shape == (1, 1, 3, 10)
+    assert attention_mask[0, 0, 1, 7] == 0
+    assert attention_mask[0, 0, 1, 8] == 0
+    assert attention_mask[0, 0, 1, 9] < -1e20

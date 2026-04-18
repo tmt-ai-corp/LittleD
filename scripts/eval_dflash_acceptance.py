@@ -39,6 +39,18 @@ def parse_args():
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--apply_ddtree",
+        action="store_true",
+        default=False,
+        help="Use DDTree verification on top of DFlash logits.",
+    )
+    parser.add_argument(
+        "--ddtree_size",
+        type=int,
+        default=32,
+        help="DDTree non-root node budget. DFlash-b16 still has max depth 16.",
+    )
     parser.add_argument("--output-path", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--torch-dtype", type=str, default="bfloat16")
@@ -171,6 +183,8 @@ def run_generation(
     max_new_tokens: int,
     temperature: float,
     stop_strings: Optional[List[str]] = None,
+    apply_ddtree: bool = False,
+    ddtree_size: int = 32,
 ):
     target_device = next(target_model.parameters()).device
     encoded = tokenizer(
@@ -191,6 +205,8 @@ def run_generation(
         temperature=temperature,
         return_stats=True,
         stop_token_sequences=stop_token_sequences,
+        apply_ddtree=apply_ddtree,
+        ddtree_size=ddtree_size,
     )
     generated = tokenizer.decode(
         output_ids[0][input_ids.shape[1] :], skip_special_tokens=True
@@ -240,6 +256,8 @@ def evaluate_benchmark(
                     or benchmarker.get_max_new_tokens(),
                     temperature=args.temperature,
                     stop_strings=stop_strings,
+                    apply_ddtree=args.apply_ddtree,
+                    ddtree_size=args.ddtree_size,
                 )
                 turn_outputs.append(generated)
                 turn_stats.append(stats)
@@ -254,6 +272,8 @@ def evaluate_benchmark(
                 max_new_tokens=args.max_new_tokens or benchmarker.get_max_new_tokens(),
                 temperature=args.temperature,
                 stop_strings=stop_strings,
+                apply_ddtree=args.apply_ddtree,
+                ddtree_size=args.ddtree_size,
             )
             turn_outputs.append(generated)
             turn_stats.append(stats)
@@ -279,6 +299,7 @@ def evaluate_benchmark(
                 "num_new_tokens": prompt_new_tokens,
                 "num_speculation_steps": prompt_steps,
                 "accept_length": prompt_new_tokens / prompt_steps if prompt_steps else 1.0,
+                "turn_stats": turn_stats,
             }
         )
 
@@ -295,6 +316,8 @@ def evaluate_benchmark(
         "accept_length": total_new_tokens / total_spec_steps if total_spec_steps else 1.0,
         "output_throughput": total_new_tokens / total_latency if total_latency > 0 else 0.0,
         "accuracy": accuracy,
+        "generation_mode": "ddtree" if args.apply_ddtree else "dflash",
+        "ddtree_size": args.ddtree_size if args.apply_ddtree else None,
         "prompts": prompt_results,
         "note": "throughput is a HF reference number; acceptance length is the primary metric for LittleBit-DFlash.",
     }
@@ -309,10 +332,17 @@ def main():
         args.target_model_path,
         trust_remote_code=args.trust_remote_code,
     )
+    target_load_kwargs = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.apply_ddtree:
+        # DDTree verifies a flattened token tree with a custom 4D ancestor mask;
+        # SDPA is the safest Transformers target backend for that path.
+        target_load_kwargs["attn_implementation"] = "sdpa"
     target_model = AutoModelForCausalLM.from_pretrained(
         args.target_model_path,
-        torch_dtype=torch_dtype,
-        trust_remote_code=args.trust_remote_code,
+        **target_load_kwargs,
     ).to(device).eval()
 
     if args.draft_type == "littlebit_dflash":
@@ -334,6 +364,8 @@ def main():
         "target_model_path": args.target_model_path,
         "draft_model_path": args.draft_model_path,
         "draft_type": args.draft_type,
+        "apply_ddtree": args.apply_ddtree,
+        "ddtree_size": args.ddtree_size if args.apply_ddtree else None,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "benchmarks": [],
     }
@@ -351,7 +383,9 @@ def main():
         )
         results["benchmarks"].append(benchmark_result)
         print(
-            f"{benchmark_name}: accept_length={benchmark_result['accept_length']:.3f}, "
+            f"{benchmark_name}: "
+            f"mode={'ddtree' if args.apply_ddtree else 'dflash'}, "
+            f"accept_length={benchmark_result['accept_length']:.3f}, "
             f"throughput={benchmark_result['output_throughput']:.3f}, "
             f"accuracy={benchmark_result['accuracy']}"
         )
