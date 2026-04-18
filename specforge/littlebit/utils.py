@@ -164,6 +164,39 @@ def _quant_config_dict(quant_args) -> dict:
     }
 
 
+def _load_state_dict_allow_meta(model: nn.Module, state_dict: dict, strict: bool = False):
+    has_meta_tensor = any(param.is_meta for param in model.parameters()) or any(
+        buffer.is_meta for buffer in model.buffers()
+    )
+    kwargs = {"strict": strict}
+    if has_meta_tensor:
+        signature = inspect.signature(model.load_state_dict)
+        if "assign" not in signature.parameters:
+            raise RuntimeError(
+                "This checkpoint requires loading into meta parameters, but this "
+                "PyTorch version does not support load_state_dict(assign=True)."
+            )
+        kwargs["assign"] = True
+
+    missing, unexpected = model.load_state_dict(state_dict, **kwargs)
+    remaining_meta = [
+        name
+        for name, param in model.named_parameters()
+        if param is not None and param.is_meta
+    ]
+    remaining_meta.extend(
+        name
+        for name, buffer in model.named_buffers()
+        if buffer is not None and buffer.is_meta
+    )
+    if remaining_meta:
+        raise RuntimeError(
+            "Some LittleBit tensors are still on meta after checkpoint load: "
+            f"{remaining_meta[:10]}"
+        )
+    return missing, unexpected
+
+
 def save_quantized_dflash_model(model: DFlashDraftModel, output_dir: str, quant_args):
     os.makedirs(output_dir, exist_ok=True)
     quant_config = _quant_config_dict(quant_args)
@@ -202,7 +235,9 @@ def load_quantized_dflash_model(
     model = apply_littlebit_patch(model, quant_args, do_train=do_train)
 
     state_dict, was_packed = _load_and_process_state_dict(model_path, torch_dtype)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = _load_state_dict_allow_meta(
+        model, state_dict, strict=False
+    )
     if missing:
         print(f"WARNING: Missing keys when loading quantized DFlash: {missing[:10]}")
     if unexpected:

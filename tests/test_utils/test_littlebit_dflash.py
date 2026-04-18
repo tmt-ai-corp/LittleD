@@ -1,10 +1,13 @@
 import torch
+from argparse import Namespace
 
 from specforge.core.littlebit_dflash import (
     compute_littlebit_dflash_losses,
     compute_littlebit_dflash_losses_from_hidden,
 )
+from specforge.littlebit import apply_littlebit_patch
 from specforge.littlebit.packing import binary_packer, binary_unpacker
+from specforge.littlebit.utils import _load_state_dict_allow_meta
 
 
 def test_binary_pack_roundtrip():
@@ -73,3 +76,35 @@ def test_chunked_hidden_losses_match_full_logits():
     assert torch.allclose(chunked.loss, full.loss, atol=1e-6)
     assert torch.allclose(chunked.kd_loss, full.kd_loss, atol=1e-6)
     assert torch.allclose(chunked.l2l_loss, full.l2l_loss, atol=1e-6)
+
+
+def test_littlebit_meta_load_assigns_real_tensors():
+    quant_args = Namespace(
+        quant_func="STEBinary",
+        split_dim=8,
+        eff_bit=None,
+        residual=False,
+        kv_factor=1.0,
+        min_split_dim=8,
+    )
+    source = torch.nn.Sequential(torch.nn.Linear(16, 12, bias=False))
+    source = apply_littlebit_patch(source, quant_args, do_train=True)
+
+    target = torch.nn.Sequential(torch.nn.Linear(16, 12, bias=False))
+    target = apply_littlebit_patch(target, quant_args, do_train=False)
+    assert any(param.is_meta for param in target.parameters())
+
+    state_dict = source.state_dict()
+    state_dict["0.U"] = source[0].U.detach()
+    state_dict["0.V"] = source[0].V.detach()
+    state_dict.pop("0.U_packed")
+    state_dict.pop("0.U_shape")
+    state_dict.pop("0.V_packed")
+    state_dict.pop("0.V_shape")
+
+    missing, unexpected = _load_state_dict_allow_meta(target, state_dict, strict=False)
+
+    assert not missing
+    assert not unexpected
+    assert not any(param.is_meta for param in target.parameters())
+    assert torch.allclose(target[0].U, source[0].U)
