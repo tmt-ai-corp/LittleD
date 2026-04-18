@@ -5,6 +5,7 @@ from specforge.core.littlebit_dflash import (
     compute_littlebit_dflash_losses,
     compute_littlebit_dflash_losses_from_hidden,
 )
+from specforge.modeling.draft.dflash import find_first_stop_sequence
 from specforge.littlebit import apply_littlebit_patch
 from specforge.littlebit.packing import binary_packer, binary_unpacker
 from specforge.littlebit.utils import _load_state_dict_allow_meta
@@ -108,3 +109,11 @@ def test_littlebit_meta_load_assigns_real_tensors():
     assert not unexpected
     assert not any(param.is_meta for param in target.parameters())
     assert torch.allclose(target[0].U, source[0].U)
+
+
+def test_find_first_stop_sequence():
+    token_ids = torch.tensor([10, 11, 12, 13, 11, 12])
+
+    assert find_first_stop_sequence(token_ids, [[11, 12]]) == 1
+    assert find_first_stop_sequence(token_ids, [[13], [11, 12]]) == 1
+    assert find_first_stop_sequence(token_ids, [[99]]) is None

@@ -127,6 +127,40 @@ def render_chat_prompt(tokenizer, messages: List[Dict[str, str]]) -> str:
     return "".join(parts)
 
 
+def get_stop_strings(benchmark_name: str) -> List[str]:
+    if benchmark_name == "gsm8k":
+        # Match the official SGLang GSM8K benchmark stop conditions. Without
+        # these, few-shot prompts often continue into the next "Question",
+        # inflating acceptance length and breaking numeric answer extraction.
+        return ["Question", "Assistant:", "<|separator|>"]
+    return []
+
+
+def build_stop_token_sequences(tokenizer, stop_strings: List[str]) -> List[List[int]]:
+    stop_token_sequences = []
+    seen = set()
+    for stop_string in stop_strings:
+        for prefix in ("", "\n", "\n\n", " "):
+            token_ids = tokenizer.encode(
+                prefix + stop_string,
+                add_special_tokens=False,
+            )
+            if not token_ids:
+                continue
+            key = tuple(token_ids)
+            if key not in seen:
+                seen.add(key)
+                stop_token_sequences.append(token_ids)
+    return stop_token_sequences
+
+
+def truncate_at_stop_strings(text: str, stop_strings: List[str]) -> str:
+    stop_positions = [text.find(stop) for stop in stop_strings if stop in text]
+    if not stop_positions:
+        return text
+    return text[: min(stop_positions)]
+
+
 def run_generation(
     *,
     draft_model,
@@ -136,6 +170,7 @@ def run_generation(
     max_input_tokens: int,
     max_new_tokens: int,
     temperature: float,
+    stop_strings: Optional[List[str]] = None,
 ):
     target_device = next(target_model.parameters()).device
     encoded = tokenizer(
@@ -146,6 +181,8 @@ def run_generation(
     )
     input_ids = encoded["input_ids"].to(target_device)
     stop_token_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else None
+    stop_strings = stop_strings or []
+    stop_token_sequences = build_stop_token_sequences(tokenizer, stop_strings)
     output_ids, stats = draft_model.spec_generate(
         target=target_model,
         input_ids=input_ids,
@@ -153,10 +190,12 @@ def run_generation(
         stop_token_ids=stop_token_ids,
         temperature=temperature,
         return_stats=True,
+        stop_token_sequences=stop_token_sequences,
     )
     generated = tokenizer.decode(
         output_ids[0][input_ids.shape[1] :], skip_special_tokens=True
     )
+    generated = truncate_at_stop_strings(generated, stop_strings)
     return generated, stats
 
 
@@ -179,6 +218,7 @@ def evaluate_benchmark(
     for question, label in zip(questions, labels):
         turn_outputs = []
         turn_stats = []
+        stop_strings = get_stop_strings(benchmark_name)
         start = time.perf_counter()
 
         if benchmark_name == "mtbench":
@@ -199,6 +239,7 @@ def evaluate_benchmark(
                     max_new_tokens=args.max_new_tokens
                     or benchmarker.get_max_new_tokens(),
                     temperature=args.temperature,
+                    stop_strings=stop_strings,
                 )
                 turn_outputs.append(generated)
                 turn_stats.append(stats)
@@ -212,6 +253,7 @@ def evaluate_benchmark(
                 max_input_tokens=args.max_input_tokens,
                 max_new_tokens=args.max_new_tokens or benchmarker.get_max_new_tokens(),
                 temperature=args.temperature,
+                stop_strings=stop_strings,
             )
             turn_outputs.append(generated)
             turn_stats.append(stats)

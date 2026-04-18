@@ -209,6 +209,26 @@ def extract_context_feature(
     return target_hidden
 
 
+def find_first_stop_sequence(
+    token_ids: torch.Tensor,
+    stop_token_sequences: Optional[list[list[int]]],
+) -> Optional[int]:
+    if not stop_token_sequences:
+        return None
+
+    token_list = token_ids.tolist()
+    best_index = None
+    for stop_sequence in stop_token_sequences:
+        if not stop_sequence:
+            continue
+        stop_len = len(stop_sequence)
+        for idx in range(0, len(token_list) - stop_len + 1):
+            if token_list[idx : idx + stop_len] == stop_sequence:
+                best_index = idx if best_index is None else min(best_index, idx)
+                break
+    return best_index
+
+
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
@@ -280,9 +300,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target: nn.Module,
         input_ids: torch.LongTensor,
         max_new_tokens: int,
-        stop_token_ids: list[int],
+        stop_token_ids: Optional[list[int]],
         temperature: float,
         return_stats: bool = False,
+        stop_token_sequences: Optional[list[list[int]]] = None,
     ):
         self.eval()
         num_input_tokens = input_ids.shape[1]
@@ -322,6 +343,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
         # Decode stage
         acceptance_lengths = []
+        stop_sequence_start = None
         start = input_ids.shape[1]
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -369,14 +391,28 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 output.hidden_states, self.target_layer_ids
             )[:, : acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length + 1)
-            if stop_token_ids is not None and any(
-                stop_token_id in output_ids[:, num_input_tokens:]
-                for stop_token_id in stop_token_ids
-            ):
+
+            search_end = min(start + 1, max_length, output_ids.shape[1])
+            stop_sequence_index = find_first_stop_sequence(
+                output_ids[0, num_input_tokens:search_end],
+                stop_token_sequences,
+            )
+            if stop_sequence_index is not None:
+                stop_sequence_start = num_input_tokens + stop_sequence_index
                 break
+
+            if stop_token_ids is not None:
+                stop_ids = torch.tensor(stop_token_ids, device=output_ids.device)
+                if torch.isin(
+                    output_ids[0, num_input_tokens:search_end],
+                    stop_ids,
+                ).any():
+                    break
         output_ids = output_ids[:, :max_length]
+        if stop_sequence_start is not None:
+            output_ids = output_ids[:, :stop_sequence_start]
         output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
-        if stop_token_ids is not None:
+        if stop_sequence_start is None and stop_token_ids is not None:
             stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
             stop_token_indices = torch.isin(
                 output_ids[0][num_input_tokens:], stop_token_ids
