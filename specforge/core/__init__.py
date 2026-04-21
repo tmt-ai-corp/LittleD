@@ -5,6 +5,13 @@ from .littlebit_dflash import (
     compute_littlebit_dflash_losses,
     compute_littlebit_dflash_losses_from_hidden,
 )
+from .dflash_dpo import (
+    DPO_DATA_VERSION,
+    DFlashDPODataset,
+    build_position_preference_pairs,
+    compute_record_dpo_loss,
+    set_littlebit_dpo_trainable,
+)
 
 __all__ = [
     "OnlineDFlashModel",
@@ -13,4 +20,9 @@ __all__ = [
     "LittleBitDFlashLosses",
     "compute_littlebit_dflash_losses",
     "compute_littlebit_dflash_losses_from_hidden",
+    "DPO_DATA_VERSION",
+    "DFlashDPODataset",
+    "build_position_preference_pairs",
+    "compute_record_dpo_loss",
+    "set_littlebit_dpo_trainable",
 ]
