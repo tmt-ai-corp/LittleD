@@ -101,6 +101,16 @@ def parse_args():
         help="Tag stored in the JSON output for this experimental eval.",
     )
     parser.add_argument(
+        "--option",
+        type=str,
+        default="1,2,3",
+        help=(
+            "Comma-separated experimental options to enable: "
+            "1=DDTree structure stats, 2=leaf-batch DFlash redraft, "
+            "3=hidden/logit tensor stats. Use 'all' or 'none' as aliases."
+        ),
+    )
+    parser.add_argument(
         "--exp-leaf-batch-size",
         type=int,
         default=0,
@@ -123,7 +133,41 @@ def parse_args():
         action="store_true",
         help="Skip the extra DFlash pass over DDTree leaf paths.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        exp_options = parse_exp_options(args.option)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.exp_disable_leaf_redraft:
+        exp_options.discard(2)
+    args.exp_options = sorted(exp_options)
+    return args
+
+
+def parse_exp_options(option_text: str) -> set[int]:
+    text = (option_text or "").strip().lower()
+    if text in {"all", "*"}:
+        return {1, 2, 3}
+    if text in {"", "none", "off", "false", "0"}:
+        return set()
+
+    options = set()
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            option = int(item)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --option value: {item!r}") from exc
+        if option not in {1, 2, 3}:
+            raise ValueError("--option only supports 1, 2, and 3")
+        options.add(option)
+    return options
+
+
+def option_enabled(args, option: int) -> bool:
+    return option in set(getattr(args, "exp_options", []))
 
 
 def safe_float(value: Any) -> Optional[float]:
@@ -344,6 +388,30 @@ def path_to_root(index: int, parents: List[int]) -> List[int]:
     return path
 
 
+def compute_leaf_paths(
+    *,
+    root_token: torch.Tensor,
+    node_token_ids: torch.Tensor,
+    parents: List[int],
+) -> List[Dict[str, Any]]:
+    children = build_children(parents)
+    tokens = [int(root_token.item())] + [int(token) for token in node_token_ids.tolist()]
+    leaf_indices = [index for index, child_list in enumerate(children) if not child_list]
+
+    leaf_paths = []
+    for leaf_index in leaf_indices:
+        path = path_to_root(leaf_index, parents)
+        leaf_paths.append(
+            {
+                "leaf_index": int(leaf_index),
+                "depth": int(len(path) - 1),
+                "path_node_indices": [int(item) for item in path],
+                "path_token_ids": [int(tokens[item]) for item in path],
+            }
+        )
+    return leaf_paths
+
+
 def tree_probability_stats(
     draft_logits: torch.Tensor,
     node_token_ids: torch.Tensor,
@@ -508,6 +576,7 @@ def run_leaf_redraft(
     stat_sample_size: int,
     top_k: int,
     leaf_batch_size: int,
+    collect_tensor_stats: bool,
 ) -> Dict[str, Any]:
     if not leaf_paths:
         return {"enabled": True, "leaf_count": 0, "groups": []}
@@ -571,47 +640,54 @@ def run_leaf_redraft(
                 noise_embedding=noise_embedding,
                 position_ids=position_ids,
                 use_cache=False,
-                output_hidden_states=True,
+                output_hidden_states=collect_tensor_stats,
                 is_causal=False,
             )
-            draft_hidden, draft_hidden_states = draft_output
+            if collect_tensor_stats:
+                draft_hidden, draft_hidden_states = draft_output
+            else:
+                draft_hidden = draft_output
+                draft_hidden_states = None
             draft_logits = target.lm_head(draft_hidden[:, -block_size + 1 :, :])
             sampled_tokens = sample(draft_logits, temperature=0.0)
-
-            redraft_stats["groups"].append(
-                {
-                    "context_length": int(context_length),
-                    "path_length": int(context_length + 1),
-                    "chunk_start": int(chunk_start),
-                    "batch_size": int(batch_size),
-                    "leaf_indices": [int(item["leaf_index"]) for item in chunk],
-                    "leaf_input_ids": [
-                        [int(token) for token in row]
-                        for row in leaf_input_ids.detach().cpu().tolist()
-                    ],
-                    "sampled_token_ids": [
-                        [int(token) for token in row]
-                        for row in sampled_tokens.detach().cpu().tolist()
-                    ],
-                    "noise_embedding": tensor_stats(
-                        noise_embedding,
-                        stat_sample_size=stat_sample_size,
-                    ),
-                    "draft_hidden": tensor_stats(
-                        draft_hidden,
-                        stat_sample_size=stat_sample_size,
-                    ),
-                    "draft_hidden_states": hidden_state_stack_stats(
-                        draft_hidden_states,
-                        stat_sample_size=stat_sample_size,
-                    ),
-                    "draft_logits": logit_stats(
-                        draft_logits,
-                        stat_sample_size=stat_sample_size,
-                        top_k=top_k,
-                    ),
-                }
-            )
+            group_stats = {
+                "context_length": int(context_length),
+                "path_length": int(context_length + 1),
+                "chunk_start": int(chunk_start),
+                "batch_size": int(batch_size),
+                "leaf_indices": [int(item["leaf_index"]) for item in chunk],
+                "leaf_input_ids": [
+                    [int(token) for token in row]
+                    for row in leaf_input_ids.detach().cpu().tolist()
+                ],
+                "sampled_token_ids": [
+                    [int(token) for token in row]
+                    for row in sampled_tokens.detach().cpu().tolist()
+                ],
+            }
+            if collect_tensor_stats:
+                group_stats.update(
+                    {
+                        "noise_embedding": tensor_stats(
+                            noise_embedding,
+                            stat_sample_size=stat_sample_size,
+                        ),
+                        "draft_hidden": tensor_stats(
+                            draft_hidden,
+                            stat_sample_size=stat_sample_size,
+                        ),
+                        "draft_hidden_states": hidden_state_stack_stats(
+                            draft_hidden_states,
+                            stat_sample_size=stat_sample_size,
+                        ),
+                        "draft_logits": logit_stats(
+                            draft_logits,
+                            stat_sample_size=stat_sample_size,
+                            top_k=top_k,
+                        ),
+                    }
+                )
+            redraft_stats["groups"].append(group_stats)
 
     return redraft_stats
 
@@ -631,6 +707,8 @@ def spec_generate_ddtree_exp(
     stat_sample_size: int,
     top_k: int,
     leaf_batch_size: int,
+    collect_tree_stats: bool,
+    collect_tensor_stats: bool,
     run_leaf_redraft_enabled: bool,
 ):
     model.eval()
@@ -717,22 +795,26 @@ def spec_generate_ddtree_exp(
         "leaf_redraft": 0.0,
     }
     exp_rounds = []
-    prefill_stats = {
-        "target_logits": logit_stats(
-            output.logits,
-            stat_sample_size=stat_sample_size,
-            top_k=top_k,
-        ),
-        "target_hidden_states": hidden_state_stack_stats(
-            output.hidden_states,
-            stat_sample_size=stat_sample_size,
-            selected_layer_ids=model.target_layer_ids,
-        ),
-        "dflash_context_feature": tensor_stats(
-            target_hidden,
-            stat_sample_size=stat_sample_size,
-        ),
-    }
+    prefill_stats = {"enabled": bool(collect_tensor_stats)}
+    if collect_tensor_stats:
+        prefill_stats.update(
+            {
+                "target_logits": logit_stats(
+                    output.logits,
+                    stat_sample_size=stat_sample_size,
+                    top_k=top_k,
+                ),
+                "target_hidden_states": hidden_state_stack_stats(
+                    output.hidden_states,
+                    stat_sample_size=stat_sample_size,
+                    selected_layer_ids=model.target_layer_ids,
+                ),
+                "dflash_context_feature": tensor_stats(
+                    target_hidden,
+                    stat_sample_size=stat_sample_size,
+                ),
+            }
+        )
 
     start = input_ids.shape[1]
     round_index = 0
@@ -756,10 +838,14 @@ def spec_generate_ddtree_exp(
             ],
             past_key_values=past_key_values_draft,
             use_cache=True,
-            output_hidden_states=True,
+            output_hidden_states=collect_tensor_stats,
             is_causal=False,
         )
-        draft_hidden, draft_hidden_states = draft_output
+        if collect_tensor_stats:
+            draft_hidden, draft_hidden_states = draft_output
+        else:
+            draft_hidden = draft_output
+            draft_hidden_states = None
         draft_logits = target.lm_head(draft_hidden[:, -draft_horizon:, :])
         past_key_values_draft.crop(start)
         ddtree_stage_times["draft"] += time.perf_counter() - stage_start
@@ -767,24 +853,29 @@ def spec_generate_ddtree_exp(
             "block_output_ids_before_tree": [
                 int(token) for token in block_output_ids[0].detach().cpu().tolist()
             ],
-            "noise_embedding": tensor_stats(
-                noise_embedding,
-                stat_sample_size=stat_sample_size,
-            ),
-            "draft_hidden": tensor_stats(
-                draft_hidden,
-                stat_sample_size=stat_sample_size,
-            ),
-            "draft_hidden_states": hidden_state_stack_stats(
-                draft_hidden_states,
-                stat_sample_size=stat_sample_size,
-            ),
-            "draft_logits": logit_stats(
-                draft_logits,
-                stat_sample_size=stat_sample_size,
-                top_k=top_k,
-            ),
         }
+        if collect_tensor_stats:
+            round_stats["draft"].update(
+                {
+                    "noise_embedding": tensor_stats(
+                        noise_embedding,
+                        stat_sample_size=stat_sample_size,
+                    ),
+                    "draft_hidden": tensor_stats(
+                        draft_hidden,
+                        stat_sample_size=stat_sample_size,
+                    ),
+                    "draft_hidden_states": hidden_state_stack_stats(
+                        draft_hidden_states,
+                        stat_sample_size=stat_sample_size,
+                    ),
+                    "draft_logits": logit_stats(
+                        draft_logits,
+                        stat_sample_size=stat_sample_size,
+                        top_k=top_k,
+                    ),
+                }
+            )
 
         stage_start = time.perf_counter()
         (
@@ -850,24 +941,39 @@ def spec_generate_ddtree_exp(
         )
         target_hidden = tree_target_hidden.index_select(1, accepted_index_tensor)
 
-        tree_stats, leaf_paths = compute_tree_stats(
-            round_index=round_index,
-            start=start,
-            block_size=block_size,
-            tree_budget=tree_budget,
-            root_token=root_token[0, 0],
-            verify_input_ids=verify_input_ids,
-            node_token_ids=node_token_ids,
-            node_depths=node_depths,
-            parents=parents,
-            child_maps=child_maps,
-            visibility_cpu=visibility_cpu,
-            draft_logits=draft_logits[0],
-            posterior=posterior,
-            accepted_indices=accepted_indices,
-            next_token=next_token,
-        )
-        round_stats["tree"] = tree_stats
+        if collect_tree_stats:
+            tree_stats, leaf_paths = compute_tree_stats(
+                round_index=round_index,
+                start=start,
+                block_size=block_size,
+                tree_budget=tree_budget,
+                root_token=root_token[0, 0],
+                verify_input_ids=verify_input_ids,
+                node_token_ids=node_token_ids,
+                node_depths=node_depths,
+                parents=parents,
+                child_maps=child_maps,
+                visibility_cpu=visibility_cpu,
+                draft_logits=draft_logits[0],
+                posterior=posterior,
+                accepted_indices=accepted_indices,
+                next_token=next_token,
+            )
+            round_stats["tree"] = tree_stats
+        else:
+            leaf_paths = (
+                compute_leaf_paths(
+                    root_token=root_token[0, 0],
+                    node_token_ids=node_token_ids,
+                    parents=parents,
+                )
+                if run_leaf_redraft_enabled
+                else []
+            )
+            round_stats["tree"] = {
+                "enabled": False,
+                "node_count_with_root": int(len(parents)),
+            }
         round_stats["verify"] = {
             "verify_input_ids": [
                 int(token) for token in verify_input_ids[0].detach().cpu().tolist()
@@ -875,28 +981,33 @@ def spec_generate_ddtree_exp(
             "verify_position_ids": [
                 int(pos) for pos in verify_position_ids[0].detach().cpu().tolist()
             ],
-            "attention_mask": tensor_stats(
-                verify_attention_mask,
-                stat_sample_size=stat_sample_size,
-            ),
-            "target_logits": logit_stats(
-                output.logits,
-                stat_sample_size=stat_sample_size,
-                top_k=top_k,
-            ),
             "posterior_token_ids": [
                 int(token) for token in posterior[0].detach().cpu().tolist()
             ],
-            "target_hidden_states": hidden_state_stack_stats(
-                output.hidden_states,
-                stat_sample_size=stat_sample_size,
-                selected_layer_ids=model.target_layer_ids,
-            ),
-            "tree_target_hidden": tensor_stats(
-                tree_target_hidden,
-                stat_sample_size=stat_sample_size,
-            ),
         }
+        if collect_tensor_stats:
+            round_stats["verify"].update(
+                {
+                    "attention_mask": tensor_stats(
+                        verify_attention_mask,
+                        stat_sample_size=stat_sample_size,
+                    ),
+                    "target_logits": logit_stats(
+                        output.logits,
+                        stat_sample_size=stat_sample_size,
+                        top_k=top_k,
+                    ),
+                    "target_hidden_states": hidden_state_stack_stats(
+                        output.hidden_states,
+                        stat_sample_size=stat_sample_size,
+                        selected_layer_ids=model.target_layer_ids,
+                    ),
+                    "tree_target_hidden": tensor_stats(
+                        tree_target_hidden,
+                        stat_sample_size=stat_sample_size,
+                    ),
+                }
+            )
 
         if run_leaf_redraft_enabled:
             leaf_stage_start = time.perf_counter()
@@ -911,6 +1022,7 @@ def spec_generate_ddtree_exp(
                 stat_sample_size=stat_sample_size,
                 top_k=top_k,
                 leaf_batch_size=leaf_batch_size,
+                collect_tensor_stats=collect_tensor_stats,
             )
             ddtree_stage_times["leaf_redraft"] += time.perf_counter() - leaf_stage_start
         else:
@@ -927,11 +1039,12 @@ def spec_generate_ddtree_exp(
             ],
             "next_token_id": int(next_token),
             "new_decode_start_index": int(start),
-            "next_context_feature": tensor_stats(
+        }
+        if collect_tensor_stats:
+            round_stats["commit"]["next_context_feature"] = tensor_stats(
                 target_hidden,
                 stat_sample_size=stat_sample_size,
-            ),
-        }
+            )
         exp_rounds.append(round_stats)
 
         search_end = min(start + 1, max_length, output_ids.shape[1])
@@ -978,6 +1091,11 @@ def spec_generate_ddtree_exp(
         "num_speculation_steps": len(acceptance_lengths),
         "accept_length": accept_length,
         "time_to_first_token": time_to_first_token,
+        "exp_option_enabled": {
+            "1_tree_stats": bool(collect_tree_stats),
+            "2_leaf_redraft": bool(run_leaf_redraft_enabled),
+            "3_hidden_logit_stats": bool(collect_tensor_stats),
+        },
         "ddtree_size": tree_budget,
         "ddtree_stage_times": ddtree_stage_times,
         "exp_prefill": prefill_stats,
@@ -998,6 +1116,8 @@ def aggregate_exp_stats(turn_stats: List[Dict[str, Any]]) -> Dict[str, Any]:
     for stats in turn_stats:
         for round_stats in stats.get("exp_rounds", []):
             tree = round_stats.get("tree", {})
+            if tree.get("enabled") is False:
+                continue
             tree_depths.append(float(tree.get("max_depth", 0)))
             tree_widths.append(float(tree.get("max_width", 0)))
             leaf_counts.append(float(tree.get("leaf_count", 0)))
@@ -1064,7 +1184,9 @@ def run_generation(
             stat_sample_size=args.exp_stat_sample_size,
             top_k=args.exp_logit_top_k,
             leaf_batch_size=args.exp_leaf_batch_size,
-            run_leaf_redraft_enabled=not args.exp_disable_leaf_redraft,
+            collect_tree_stats=option_enabled(args, 1),
+            collect_tensor_stats=option_enabled(args, 3),
+            run_leaf_redraft_enabled=option_enabled(args, 2),
         )
     else:
         output_ids, stats = draft_model.spec_generate(
@@ -1191,6 +1313,7 @@ def evaluate_benchmark(
         "generation_mode": "ddtree_exp" if args.apply_ddtree else "dflash",
         "ddtree_size": args.ddtree_size if args.apply_ddtree else None,
         "exp_tag": args.exp_tag,
+        "exp_options": args.exp_options,
         "exp_summary": aggregate_exp_stats(all_turn_stats),
         "prompts": prompt_results,
         "note": (
@@ -1242,6 +1365,7 @@ def main():
         "draft_type": args.draft_type,
         "apply_ddtree": args.apply_ddtree,
         "ddtree_size": args.ddtree_size if args.apply_ddtree else None,
+        "exp_options": args.exp_options,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "args": vars(args),
         "benchmarks": [],
@@ -1262,6 +1386,7 @@ def main():
         print(
             f"{benchmark_name}: "
             f"tag={args.exp_tag}, "
+            f"option={','.join(str(item) for item in args.exp_options) or 'none'}, "
             f"mode={'ddtree_exp' if args.apply_ddtree else 'dflash'}, "
             f"accept_length={benchmark_result['accept_length']:.3f}, "
             f"throughput={benchmark_result['output_throughput']:.3f}, "
