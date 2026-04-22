@@ -304,6 +304,33 @@ def render_record_prompt(record: Any, tokenizer, prompt_field: str) -> str:
     raise ValueError(f"Could not infer a prompt from record keys: {sorted(record)}")
 
 
+def get_record_stop_strings(record: Any, default_stop_strings: List[str]) -> List[str]:
+    if not isinstance(record, dict):
+        return list(default_stop_strings)
+    for key in ("stop_strings", "stop", "stop_sequences"):
+        value = record.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        raise ValueError(f"Expected {key} to be a string or list, got {type(value)}")
+    return list(default_stop_strings)
+
+
+def get_record_metadata(record: Any, idx: int) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {"input_index": idx}
+    if not isinstance(record, dict):
+        return metadata
+    if isinstance(record.get("metadata"), dict):
+        metadata.update(record["metadata"])
+    for key in ("id", "benchmark", "benchmark_index", "source"):
+        if key in record:
+            metadata[key] = record[key]
+    return metadata
+
+
 def iter_prompt_items(args, tokenizer) -> Iterable[PromptItem]:
     emitted = 0
 
@@ -311,12 +338,13 @@ def iter_prompt_items(args, tokenizer) -> Iterable[PromptItem]:
         path = Path(args.input_path)
         for idx, record in enumerate(read_json_records(path, args.input_format)):
             prompt = render_record_prompt(record, tokenizer, args.prompt_field)
+            stop_strings = get_record_stop_strings(record, args.stop_strings)
             yield PromptItem(
                 sample_id=f"input:{idx}",
                 source=str(path),
                 prompt=prompt,
-                stop_strings=list(args.stop_strings),
-                metadata={"input_index": idx},
+                stop_strings=stop_strings,
+                metadata=get_record_metadata(record, idx),
             )
             emitted += 1
             if args.num_samples is not None and emitted >= args.num_samples:
