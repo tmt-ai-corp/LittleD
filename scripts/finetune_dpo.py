@@ -108,6 +108,16 @@ def parse_args() -> argparse.Namespace:
     training_group.add_argument("--beta", type=float, default=0.2)
     training_group.add_argument("--label-smoothing", type=float, default=0.0)
     training_group.add_argument(
+        "--loss-decay-gamma",
+        type=float,
+        default=None,
+        help=(
+            "Optional exponential depth decay for DPO pair weights: "
+            "weight *= exp(-(depth - 1) / gamma). Omit or set <= 0 to disable; "
+            "DFlash examples use 7.0."
+        ),
+    )
+    training_group.add_argument(
         "--detach-draft-cache",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -477,6 +487,7 @@ def main() -> None:
                         label_smoothing=args.label_smoothing,
                         max_rounds_per_record=args.max_rounds_per_record,
                         max_pairs_per_round=args.max_pairs_per_round,
+                        loss_decay_gamma=args.loss_decay_gamma,
                         detach_draft_cache=args.detach_draft_cache,
                     )
                     local_metrics["rounds"] += metrics.get("rounds", 0.0)

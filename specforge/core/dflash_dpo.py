@@ -311,6 +311,7 @@ def _round_pair_tensors(
     *,
     device: torch.device,
     max_pairs_per_round: Optional[int],
+    loss_decay_gamma: Optional[float],
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     pairs = round_item.get("pairs", {})
     depths = pairs.get("depths")
@@ -338,6 +339,10 @@ def _round_pair_tensors(
         chosen = chosen[:max_pairs_per_round]
         rejected = rejected[:max_pairs_per_round]
         weights = weights[:max_pairs_per_round]
+
+    if loss_decay_gamma is not None and loss_decay_gamma > 0:
+        depth_offsets = (depths.to(dtype=torch.float32) - 1.0).clamp(min=0.0)
+        weights = weights * torch.exp(-depth_offsets / float(loss_decay_gamma))
 
     return (
         depths.to(device=device, dtype=torch.long) - 1,
@@ -471,6 +476,7 @@ def compute_record_dpo_loss(
     label_smoothing: float,
     max_rounds_per_record: Optional[int],
     max_pairs_per_round: Optional[int],
+    loss_decay_gamma: Optional[float],
     detach_draft_cache: bool,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     policy_cache = DynamicCache()
@@ -497,6 +503,7 @@ def compute_record_dpo_loss(
             round_item,
             device=device,
             max_pairs_per_round=max_pairs_per_round,
+            loss_decay_gamma=loss_decay_gamma,
         )
         policy_hidden = forward_dflash_round_hidden(
             draft_model=policy_model,
