@@ -102,6 +102,29 @@ def parse_args():
     dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
     dataset_group.add_argument(
+        "--debug-dataset-samples",
+        type=int,
+        default=0,
+        help="Print decoded processed samples with loss-mask spans on rank 0.",
+    )
+    dataset_group.add_argument(
+        "--debug-dataset-stat-samples",
+        type=int,
+        default=1000,
+        help="Number of processed samples to scan for debug loss-mask stats.",
+    )
+    dataset_group.add_argument(
+        "--debug-dataset-max-chars",
+        type=int,
+        default=4000,
+        help="Maximum decoded characters to print per debug sample.",
+    )
+    dataset_group.add_argument(
+        "--debug-dataset-only",
+        action="store_true",
+        help="Build and inspect the processed dataset, then exit before training.",
+    )
+    dataset_group.add_argument(
         "--build-dataset-num-proc",
         type=int,
         default=int(os.environ.get("SPECFORGE_DATA_NUM_PROC", 8)),
@@ -239,6 +262,8 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     print_on_rank0(
         f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
     )
+    if args.debug_dataset_samples > 0:
+        debug_processed_dataset(args, tokenizer, train_eagle3_dataset)
 
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
@@ -267,6 +292,114 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         )
 
     return train_dataloader, eval_dataloader
+
+
+def _to_1d_tensor(value) -> torch.Tensor:
+    if torch.is_tensor(value):
+        return value.flatten().cpu()
+    return torch.tensor(value).flatten()
+
+
+def _decode_masked_text(tokenizer, input_ids, loss_mask, max_chars: int) -> str:
+    input_ids = _to_1d_tensor(input_ids)
+    loss_mask = _to_1d_tensor(loss_mask)
+    if input_ids.numel() == 0:
+        return ""
+
+    chunks = []
+    current_mask = int(loss_mask[0].item())
+    current_ids = [int(input_ids[0].item())]
+    for idx in range(1, input_ids.numel()):
+        mask_value = int(loss_mask[idx].item())
+        token_id = int(input_ids[idx].item())
+        if mask_value == current_mask:
+            current_ids.append(token_id)
+            continue
+
+        text = tokenizer.decode(current_ids, skip_special_tokens=False)
+        if current_mask:
+            chunks.append("[LOSS_START]" + text + "[LOSS_END]")
+        else:
+            chunks.append(text)
+        current_mask = mask_value
+        current_ids = [token_id]
+
+    text = tokenizer.decode(current_ids, skip_special_tokens=False)
+    if current_mask:
+        chunks.append("[LOSS_START]" + text + "[LOSS_END]")
+    else:
+        chunks.append(text)
+
+    rendered = "".join(chunks)
+    if len(rendered) > max_chars:
+        rendered = rendered[:max_chars] + "\n...[truncated debug print]..."
+    return rendered
+
+
+def _print_loss_mask_stats(args, dataset) -> None:
+    if dist.get_rank() != 0:
+        return
+    scan_count = min(len(dataset), max(args.debug_dataset_stat_samples, 0))
+    if scan_count == 0:
+        print_on_rank0("Debug dataset stats skipped: no samples to scan.")
+        return
+
+    loss_counts = []
+    seq_lens = []
+    for idx in range(scan_count):
+        sample = dataset[idx]
+        loss_mask = _to_1d_tensor(sample["loss_mask"])
+        input_ids = _to_1d_tensor(sample["input_ids"])
+        loss_counts.append(int(loss_mask.sum().item()))
+        seq_lens.append(int(input_ids.numel()))
+
+    loss_counts_t = torch.tensor(loss_counts, dtype=torch.float32)
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.float32)
+    print_on_rank0(
+        "Debug dataset stats "
+        f"(first {scan_count} filtered samples): "
+        f"seq_len mean={seq_lens_t.mean().item():.1f}, "
+        f"min={int(seq_lens_t.min().item())}, max={int(seq_lens_t.max().item())}; "
+        f"loss_tokens mean={loss_counts_t.mean().item():.1f}, "
+        f"min={int(loss_counts_t.min().item())}, max={int(loss_counts_t.max().item())}"
+    )
+
+
+def debug_processed_dataset(args, tokenizer, dataset) -> None:
+    if dist.get_rank() != 0:
+        return
+    _print_loss_mask_stats(args, dataset)
+
+    sample_count = min(args.debug_dataset_samples, len(dataset))
+    for idx in range(sample_count):
+        sample = dataset[idx]
+        input_ids = _to_1d_tensor(sample["input_ids"])
+        loss_mask = _to_1d_tensor(sample["loss_mask"])
+        loss_positions = torch.where(loss_mask > 0)[0]
+        if loss_positions.numel() > 0:
+            first_loss = int(loss_positions[0].item())
+            last_loss = int(loss_positions[-1].item())
+        else:
+            first_loss = -1
+            last_loss = -1
+
+        print_on_rank0("\n" + "=" * 80)
+        print_on_rank0(
+            f"Debug processed sample {idx}: "
+            f"seq_len={input_ids.numel()}, "
+            f"loss_tokens={int(loss_mask.sum().item())}, "
+            f"first_loss={first_loss}, last_loss={last_loss}"
+        )
+        print_on_rank0(
+            _decode_masked_text(
+                tokenizer,
+                input_ids,
+                loss_mask,
+                max_chars=args.debug_dataset_max_chars,
+            )
+        )
+    if sample_count:
+        print_on_rank0("=" * 80 + "\n")
 
 
 def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
@@ -357,6 +490,13 @@ def main():
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
+
+    if args.debug_dataset_only:
+        tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+        build_dataloader(args, tokenizer)
+        print_on_rank0("Debug dataset inspection complete. Exiting before training.")
+        destroy_distributed()
+        return
 
     draft_model_last_checkpoint = None
     ckpt_info = (0, 0)
