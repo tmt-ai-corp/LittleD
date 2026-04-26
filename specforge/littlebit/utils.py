@@ -15,8 +15,8 @@ from transformers import AutoConfig
 
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
-from .modules import LittleBitLinear
-from .packing import binary_unpacker
+from .modules import LittleBitLinear, LittleBitOnDeviceLinear
+from .packing import binary_unpacker, int2_unpacker
 
 __all__ = [
     "apply_littlebit_patch",
@@ -26,12 +26,31 @@ __all__ = [
 ]
 
 
+_LITTLEBIT_MODULES = {
+    "LittleBitLinear": LittleBitLinear,
+    "littlebit": LittleBitLinear,
+    "default": LittleBitLinear,
+    "LittleBitOnDeviceLinear": LittleBitOnDeviceLinear,
+    "littlebit_on_device": LittleBitOnDeviceLinear,
+    "on_device": LittleBitOnDeviceLinear,
+}
+
+
 def load_quant_fn(name: str):
     module = importlib.import_module("specforge.littlebit.functions")
     try:
         return getattr(module, name)
     except AttributeError as exc:
         raise ValueError(f"Unknown LittleBit quant function: {name}") from exc
+
+
+def load_quant_module(name: str | type[nn.Module]):
+    if isinstance(name, type) and issubclass(name, nn.Module):
+        return name
+    try:
+        return _LITTLEBIT_MODULES[str(name)]
+    except KeyError as exc:
+        raise ValueError(f"Unknown LittleBit quant module: {name}") from exc
 
 
 def apply_littlebit_patch(
@@ -43,6 +62,9 @@ def apply_littlebit_patch(
 ):
     exclude_names = exclude_names or ["lm_head"]
     quant_func = load_quant_fn(getattr(quant_args, "quant_func", "STEBinary"))
+    quant_mod = load_quant_module(
+        getattr(quant_args, "quant_mod", "LittleBitLinear")
+    )
     common_kwargs = {
         "do_train": do_train,
         "quant_func": quant_func,
@@ -50,6 +72,7 @@ def apply_littlebit_patch(
         "split_dim": getattr(quant_args, "split_dim", 1024),
         "eff_bit": getattr(quant_args, "eff_bit", 1.0),
         "min_split_dim": getattr(quant_args, "min_split_dim", 8),
+        "group_size": getattr(quant_args, "group_size", 128),
     }
     kv_kwargs = {
         "ratio_factor": getattr(quant_args, "kv_factor", 1.0),
@@ -66,7 +89,7 @@ def apply_littlebit_patch(
         if any(pattern.search(name) for pattern in kv_patterns):
             current_kwargs.update(kv_kwargs)
 
-        module.__class__ = LittleBitLinear
+        module.__class__ = quant_mod
         module.__quant_convert__(**current_kwargs)
 
     return model
@@ -119,7 +142,7 @@ def _load_and_process_state_dict(model_path: str, torch_dtype: torch.dtype):
 
     packed_components = defaultdict(dict)
     final_state_dict = {}
-    pattern = re.compile(r"^(.*)\.([^.]+?)_(packed|shape)$")
+    pattern = re.compile(r"^(.*)\.([^.]+?)_(packed|shape|bit_width|quant_min)$")
 
     for key, value in state_dict.items():
         match = pattern.match(key)
@@ -139,7 +162,22 @@ def _load_and_process_state_dict(model_path: str, torch_dtype: torch.dtype):
             if packed_tensor is None or shape_tensor is None:
                 continue
             shape = tuple(shape_tensor.tolist())
-            unpacked = binary_unpacker(packed_tensor, shape).to(torch_dtype)
+            bit_width_tensor = components.get(f"{name}_bit_width")
+            bit_width = (
+                1 if bit_width_tensor is None else int(bit_width_tensor.item())
+            )
+            if bit_width == 1:
+                unpacked = binary_unpacker(packed_tensor, shape).to(torch_dtype)
+            elif bit_width == 2:
+                quant_min_tensor = components.get(f"{name}_quant_min")
+                quant_min = -2 if quant_min_tensor is None else int(
+                    quant_min_tensor.item()
+                )
+                unpacked = int2_unpacker(
+                    packed_tensor, shape, quant_min=quant_min
+                ).to(torch_dtype)
+            else:
+                raise ValueError(f"Unsupported packed LittleBit bit width: {bit_width}")
             final_state_dict[f"{prefix}.{name}"] = unpacked
 
     return final_state_dict, True
@@ -155,12 +193,14 @@ def read_littlebit_config(model_path: str) -> dict:
 
 def _quant_config_dict(quant_args) -> dict:
     return {
+        "quant_mod": getattr(quant_args, "quant_mod", "LittleBitLinear"),
         "quant_func": getattr(quant_args, "quant_func", "STEBinary"),
         "eff_bit": getattr(quant_args, "eff_bit", 1.0),
         "split_dim": getattr(quant_args, "split_dim", 1024),
         "residual": getattr(quant_args, "residual", False),
         "kv_factor": getattr(quant_args, "kv_factor", 1.0),
         "min_split_dim": getattr(quant_args, "min_split_dim", 8),
+        "group_size": getattr(quant_args, "group_size", 128),
     }
 
 
@@ -247,7 +287,9 @@ def load_quantized_dflash_model(
 
     if was_packed:
         for module in model.modules():
-            if isinstance(module, LittleBitLinear):
+            if isinstance(module, LittleBitOnDeviceLinear):
+                module.set_packed_mode(True, do_train=do_train)
+            elif isinstance(module, LittleBitLinear):
                 module._binarized = True
 
     if device == "auto":

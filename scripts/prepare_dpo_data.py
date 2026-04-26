@@ -153,11 +153,13 @@ def parse_args() -> argparse.Namespace:
     output_group.add_argument("--samples-per-shard", type=int, default=32)
 
     quant_group = parser.add_argument_group("littlebit fallback config")
+    quant_group.add_argument("--quant-mod", type=str, default="LittleBitLinear")
     quant_group.add_argument("--quant-func", type=str, default="STEBinary")
     quant_group.add_argument("--split-dim", type=int, default=1024)
     quant_group.add_argument("--eff-bit", type=float, default=0.5)
     quant_group.add_argument("--kv-factor", type=float, default=1.0)
     quant_group.add_argument("--min-split-dim", type=int, default=8)
+    quant_group.add_argument("--group-size", type=int, default=128)
     quant_group.add_argument("--residual", action="store_true")
 
     return parser.parse_args()

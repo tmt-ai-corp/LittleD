@@ -223,7 +223,20 @@ def set_littlebit_dpo_trainable(
     for param in model.parameters():
         param.requires_grad = False
 
-    scale_names = {"u1", "u2", "v1", "v2", "u1_R", "u2_R", "v1_R", "v2_R"}
+    scale_names = {
+        "u1",
+        "u2",
+        "v1",
+        "v2",
+        "u1_R",
+        "u2_R",
+        "v1_R",
+        "v2_R",
+        "U_scale",
+        "V_scale",
+        "U_R_scale",
+        "V_R_scale",
+    }
     trainable_names: List[str] = []
     total_trainable = 0
 

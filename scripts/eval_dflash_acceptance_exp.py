@@ -87,11 +87,13 @@ def parse_args():
     parser.add_argument("--torch-dtype", type=str, default="bfloat16")
     parser.add_argument("--trust-remote-code", action="store_true")
 
+    parser.add_argument("--quant-mod", type=str, default="LittleBitLinear")
     parser.add_argument("--quant-func", type=str, default="STEBinary")
     parser.add_argument("--split-dim", type=int, default=1024)
     parser.add_argument("--eff-bit", type=float, default=0.5)
     parser.add_argument("--kv-factor", type=float, default=1.0)
     parser.add_argument("--min-split-dim", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--residual", action="store_true")
 
     parser.add_argument(

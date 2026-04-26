@@ -1,5 +1,8 @@
-import torch
+import tempfile
 from argparse import Namespace
+from pathlib import Path
+
+import torch
 
 from specforge.core.littlebit_dflash import (
     compute_littlebit_dflash_losses,
@@ -11,15 +14,33 @@ from specforge.modeling.draft.dflash import (
     find_first_stop_sequence,
     follow_verified_tree,
 )
-from specforge.littlebit import apply_littlebit_patch
-from specforge.littlebit.packing import binary_packer, binary_unpacker
-from specforge.littlebit.utils import _load_state_dict_allow_meta
+from specforge.littlebit import LittleBitOnDeviceLinear, apply_littlebit_patch
+from specforge.littlebit.packing import (
+    binary_packer,
+    binary_unpacker,
+    int2_packer,
+    int2_unpacker,
+)
+from specforge.littlebit.utils import (
+    _load_and_process_state_dict,
+    _load_state_dict_allow_meta,
+)
 
 
 def test_binary_pack_roundtrip():
     tensor = torch.tensor([[1, -1, 1, -1, 1, -1, 1, -1]], dtype=torch.int8)
     packed = binary_packer(tensor)
     unpacked = binary_unpacker(packed, tensor.shape)
+    assert torch.equal(unpacked, tensor)
+
+
+def test_int2_pack_roundtrip():
+    tensor = torch.tensor(
+        [[-2, -1, 0, 1] * 5, [1, 0, -1, -2] * 5],
+        dtype=torch.int8,
+    )
+    packed = int2_packer(tensor)
+    unpacked = int2_unpacker(packed, tensor.shape)
     assert torch.equal(unpacked, tensor)
 
 
@@ -114,6 +135,49 @@ def test_littlebit_meta_load_assigns_real_tensors():
     assert not unexpected
     assert not any(param.is_meta for param in target.parameters())
     assert torch.allclose(target[0].U, source[0].U)
+
+
+def test_littlebit_on_device_packed_load_matches_qat_forward():
+    quant_args = Namespace(
+        quant_mod="LittleBitOnDeviceLinear",
+        quant_func="STEBinary",
+        split_dim=32,
+        eff_bit=None,
+        residual=False,
+        kv_factor=1.0,
+        min_split_dim=32,
+        group_size=128,
+    )
+    torch.manual_seed(0)
+    source = torch.nn.Sequential(torch.nn.Linear(256, 128, bias=False))
+    source = apply_littlebit_patch(source, quant_args, do_train=True)
+    assert isinstance(source[0], LittleBitOnDeviceLinear)
+    assert source[0].split_dim_used == 32
+    assert source[0].U_scale.shape == (128, 1)
+    assert source[0].V_scale.shape == (32, 2)
+
+    x = torch.randn(3, 256, dtype=torch.bfloat16)
+    source_output = source(x)
+    state_dict = source.state_dict()
+    assert "0.U" not in state_dict
+    assert "0.V" not in state_dict
+    assert state_dict["0.U_bit_width"].item() == 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        torch.save(state_dict, Path(tmp) / "pytorch_model.bin")
+        loaded_state, was_packed = _load_and_process_state_dict(tmp, torch.bfloat16)
+        assert was_packed
+
+    target = torch.nn.Sequential(torch.nn.Linear(256, 128, bias=False))
+    target = apply_littlebit_patch(target, quant_args, do_train=False)
+    missing, unexpected = _load_state_dict_allow_meta(
+        target, loaded_state, strict=False
+    )
+    assert not missing
+    assert not unexpected
+    target[0].set_packed_mode(True, do_train=False)
+
+    assert torch.equal(target(x), source_output)
 
 
 def test_find_first_stop_sequence():
