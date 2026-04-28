@@ -22,6 +22,54 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from typing_extensions import Tuple, Unpack
 
 
+class _FullStorageSlidingWindowCache(DynamicCache):
+    """Dynamic cache that rolls back like full cache but returns sliding K/V views."""
+
+    def __init__(self, sliding_windows: dict[int, int]) -> None:
+        super().__init__()
+        self.sliding_windows = sliding_windows
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[dict] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        keys, values = super().update(
+            key_states,
+            value_states,
+            layer_idx,
+            cache_kwargs,
+        )
+        sliding_window = self.sliding_windows.get(layer_idx)
+        if sliding_window is None:
+            return keys, values
+
+        current_length = key_states.shape[-2]
+        view_length = min(keys.shape[-2], int(sliding_window) + current_length - 1)
+        return keys[..., -view_length:, :], values[..., -view_length:, :]
+
+
+def _make_target_cache(target: nn.Module) -> DynamicCache:
+    layers = getattr(getattr(target, "model", None), "layers", None)
+    if layers is None:
+        return DynamicCache()
+
+    sliding_windows: dict[int, int] = {}
+    for layer_idx, layer in enumerate(layers):
+        self_attn = getattr(layer, "self_attn", None)
+        if not getattr(self_attn, "is_sliding", False):
+            continue
+        sliding_window = getattr(self_attn, "sliding_window", None)
+        if sliding_window is not None:
+            sliding_windows[layer_idx] = int(sliding_window)
+
+    if not sliding_windows:
+        return DynamicCache()
+    return _FullStorageSlidingWindowCache(sliding_windows)
+
+
 def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
@@ -574,7 +622,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output_ids.shape[1], device=target.device
         ).unsqueeze(0)
 
-        past_key_values_target = DynamicCache()
+        past_key_values_target = _make_target_cache(target)
         past_key_values_draft = DynamicCache()
 
         # Prefill stage
@@ -756,7 +804,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             device=target.device,
         )
 
-        past_key_values_target = DynamicCache()
+        past_key_values_target = _make_target_cache(target)
         past_key_values_draft = DynamicCache()
 
         output = target(
