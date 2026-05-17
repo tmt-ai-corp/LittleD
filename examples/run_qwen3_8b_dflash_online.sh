@@ -7,6 +7,9 @@ export SPECFORGE_DATA_NUM_PROC=32
 NUM_GPUS=${1:-8}
 
 ATTENTION_BACKEND=${2:-flex_attention}
+EARLY_EXIT_HIDDEN_MODE=${EARLY_EXIT_HIDDEN_MODE:-none}
+EARLY_EXIT_AVAILABLE_HIDDEN_COUNT=${EARLY_EXIT_AVAILABLE_HIDDEN_COUNT:-3}
+EARLY_EXIT_PREFILL_MASK_MODE=${EARLY_EXIT_PREFILL_MASK_MODE:-loss_mask_zero}
 
 torchrun \
     --standalone \
@@ -26,6 +29,9 @@ torchrun \
     --attention-backend $ATTENTION_BACKEND \
     --num-anchors 512 \
     --loss-decay-gamma 7.0 \
+    --early-exit-hidden-mode $EARLY_EXIT_HIDDEN_MODE \
+    --early-exit-available-hidden-count $EARLY_EXIT_AVAILABLE_HIDDEN_COUNT \
+    --early-exit-prefill-mask-mode $EARLY_EXIT_PREFILL_MASK_MODE \
     --log-interval 50 \
     --save-interval 1000 \
     --report-to wandb \

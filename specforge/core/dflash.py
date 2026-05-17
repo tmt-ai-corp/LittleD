@@ -103,6 +103,7 @@ class DFlashTrainingView:
     attention_mask: torch.Tensor
     target_ids: torch.Tensor
     weight_mask: torch.Tensor
+    prefill_mask: Optional[torch.Tensor] = None
 
 
 class OnlineDFlashModel(nn.Module):
@@ -119,6 +120,9 @@ class OnlineDFlashModel(nn.Module):
         num_anchors: int = 512,
         fixed_num_anchors: bool = False,
         loss_decay_gamma: Optional[float] = None,
+        early_exit_hidden_mode: str = "none",
+        early_exit_available_hidden_count: Optional[int] = None,
+        early_exit_prefill_mask_mode: str = "loss_mask_zero",
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -130,10 +134,93 @@ class OnlineDFlashModel(nn.Module):
         self.num_anchors = num_anchors
         self.fixed_num_anchors = fixed_num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.early_exit_hidden_mode = early_exit_hidden_mode
+        self.early_exit_available_hidden_count = early_exit_available_hidden_count
+        self.early_exit_prefill_mask_mode = early_exit_prefill_mask_mode
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+    def _create_prefill_mask(self, loss_mask: torch.Tensor) -> torch.Tensor:
+        if self.early_exit_prefill_mask_mode == "loss_mask_zero":
+            return loss_mask <= 0.5
+
+        if self.early_exit_prefill_mask_mode == "before_first_loss":
+            bsz, seq_len = loss_mask.shape
+            has_loss = loss_mask.sum(dim=1) > 0
+            first_loss = torch.argmax((loss_mask > 0.5).long(), dim=1)
+            positions = torch.arange(seq_len, device=loss_mask.device).unsqueeze(0)
+            return (positions < first_loss.unsqueeze(1)) & has_loss.unsqueeze(1)
+
+        raise ValueError(
+            f"Unsupported early_exit_prefill_mask_mode: "
+            f"{self.early_exit_prefill_mask_mode}"
+        )
+
+    def _apply_early_exit_hidden_imputation(
+        self,
+        hidden_states: torch.Tensor,
+        prefill_mask: Optional[torch.Tensor],
+        draft_model: Optional[DFlashDraftModel] = None,
+    ) -> torch.Tensor:
+        if self.early_exit_hidden_mode == "none":
+            return hidden_states
+        if prefill_mask is None:
+            raise ValueError(
+                "prefill_mask is required for early-exit hidden imputation."
+            )
+
+        draft_model = draft_model or self.draft_model
+        hidden_size = draft_model.config.hidden_size
+        if hidden_states.shape[-1] % hidden_size != 0:
+            raise ValueError(
+                "DFlash hidden_states last dimension must be divisible by "
+                f"hidden_size={hidden_size}, got {hidden_states.shape[-1]}."
+            )
+
+        hidden_count = hidden_states.shape[-1] // hidden_size
+        available_count = self.early_exit_available_hidden_count
+        if available_count is None:
+            available_count = int(
+                getattr(
+                    draft_model,
+                    "early_exit_available_hidden_count",
+                    hidden_count,
+                )
+            )
+        available_count = int(available_count)
+        if available_count <= 0 or available_count >= hidden_count:
+            return hidden_states
+
+        chunks = list(hidden_states.split(hidden_size, dim=-1))
+        source = chunks[available_count - 1]
+        prefill_mask = prefill_mask.to(device=hidden_states.device, dtype=torch.bool)
+        prefill_mask = prefill_mask.unsqueeze(-1)
+
+        for chunk_idx in range(available_count, hidden_count):
+            missing_idx = chunk_idx - available_count
+            replacement = source
+            if self.early_exit_hidden_mode == "add_embed":
+                embed = getattr(draft_model, "early_exit_hidden_embed", None)
+                if embed is None:
+                    raise ValueError("early_exit_hidden_embed is not initialized.")
+                replacement = source + embed[missing_idx].view(1, 1, -1)
+            elif self.early_exit_hidden_mode == "gate":
+                gate = getattr(draft_model, "early_exit_hidden_gate", None)
+                if gate is None:
+                    raise ValueError("early_exit_hidden_gate is not initialized.")
+                replacement = source * (1 + gate[missing_idx].view(1, 1, -1))
+            elif self.early_exit_hidden_mode != "copy":
+                raise ValueError(
+                    f"Unsupported early_exit_hidden_mode: "
+                    f"{self.early_exit_hidden_mode}"
+                )
+            chunks[chunk_idx] = torch.where(
+                prefill_mask, replacement, chunks[chunk_idx]
+            )
+
+        return torch.cat(chunks, dim=-1)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -338,6 +425,7 @@ class OnlineDFlashModel(nn.Module):
             attention_mask=dflash_attn_mask,
             target_ids=target_ids,
             weight_mask=weight_mask,
+            prefill_mask=self._create_prefill_mask(loss_mask),
         )
 
     def forward_hidden_from_view(
@@ -348,6 +436,11 @@ class OnlineDFlashModel(nn.Module):
         output_hidden_states: bool = False,
     ):
         draft_model = draft_model or self.draft_model
+        hidden_states = self._apply_early_exit_hidden_imputation(
+            hidden_states=hidden_states,
+            prefill_mask=training_view.prefill_mask,
+            draft_model=draft_model,
+        )
         model_outputs = draft_model(
             position_ids=training_view.position_ids,
             noise_embedding=training_view.noise_embedding,

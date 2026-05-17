@@ -535,6 +535,24 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             "target_layer_ids",
             build_target_layer_ids(config.num_target_layers, config.num_hidden_layers),
         )
+        self.early_exit_hidden_mode = dflash_config.get(
+            "early_exit_hidden_mode", "none"
+        )
+        self.early_exit_available_hidden_count = int(
+            dflash_config.get(
+                "early_exit_available_hidden_count", len(self.target_layer_ids)
+            )
+        )
+        self.early_exit_target_hidden_count = int(
+            dflash_config.get(
+                "early_exit_target_hidden_count", len(self.target_layer_ids)
+            )
+        )
+        num_early_exit_missing = max(
+            self.early_exit_target_hidden_count
+            - self.early_exit_available_hidden_count,
+            0,
+        )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(
@@ -545,6 +563,19 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        if self.early_exit_hidden_mode == "add_embed" and num_early_exit_missing > 0:
+            self.early_exit_hidden_embed = nn.Parameter(
+                torch.zeros(num_early_exit_missing, config.hidden_size)
+            )
+        else:
+            self.register_parameter("early_exit_hidden_embed", None)
+
+        if self.early_exit_hidden_mode == "gate" and num_early_exit_missing > 0:
+            self.early_exit_hidden_gate = nn.Parameter(
+                torch.zeros(num_early_exit_missing, config.hidden_size)
+            )
+        else:
+            self.register_parameter("early_exit_hidden_gate", None)
         self.post_init()
 
     def forward(

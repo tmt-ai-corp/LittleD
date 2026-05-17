@@ -81,6 +81,37 @@ def parse_args():
         "Suggested: 7 for block_size=16, 5 for 10, 4 for 8. None disables.",
     )
     model_group.add_argument(
+        "--early-exit-hidden-mode",
+        type=str,
+        default="none",
+        choices=["none", "copy", "add_embed", "gate"],
+        help=(
+            "How to impute missing prefill hidden chunks for early-exit prefill. "
+            "'copy' repeats the last available chunk; 'add_embed' uses h + e_i; "
+            "'gate' uses h * (1 + g_i)."
+        ),
+    )
+    model_group.add_argument(
+        "--early-exit-available-hidden-count",
+        type=int,
+        default=3,
+        help=(
+            "Number of target hidden chunks available during early-exit prefill. "
+            "Chunks after this count are imputed only on prefill-mask positions."
+        ),
+    )
+    model_group.add_argument(
+        "--early-exit-prefill-mask-mode",
+        type=str,
+        default="loss_mask_zero",
+        choices=["loss_mask_zero", "before_first_loss"],
+        help=(
+            "Which sequence positions should receive early-exit hidden imputation. "
+            "'loss_mask_zero' covers prompt/non-loss tokens; 'before_first_loss' "
+            "covers tokens before the first supervised answer token."
+        ),
+    )
+    model_group.add_argument(
         "--embedding-key",
         type=str,
         default=None,
@@ -210,6 +241,37 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
 
     if not hasattr(draft_config, "dflash_config") or draft_config.dflash_config is None:
         draft_config.dflash_config = {}
+
+    target_layer_ids = draft_config.dflash_config.get(
+        "target_layer_ids",
+        None,
+    )
+    if target_layer_ids is None:
+        target_layer_ids = getattr(draft_config, "target_layer_ids", None)
+    if target_layer_ids is None:
+        num_target_layers = getattr(draft_config, "num_target_layers")
+        num_draft_layers = getattr(draft_config, "num_hidden_layers")
+        from specforge.modeling.draft.dflash import build_target_layer_ids
+
+        target_layer_ids = build_target_layer_ids(num_target_layers, num_draft_layers)
+
+    if args.early_exit_hidden_mode != "none":
+        if args.early_exit_available_hidden_count >= len(target_layer_ids):
+            raise ValueError(
+                "--early-exit-available-hidden-count must be smaller than the "
+                "number of target_layer_ids when early-exit imputation is enabled."
+            )
+        draft_config.dflash_config["early_exit_hidden_mode"] = (
+            args.early_exit_hidden_mode
+        )
+        draft_config.dflash_config["early_exit_available_hidden_count"] = (
+            args.early_exit_available_hidden_count
+        )
+        draft_config.dflash_config["early_exit_target_hidden_count"] = len(
+            target_layer_ids
+        )
+    else:
+        draft_config.dflash_config["early_exit_hidden_mode"] = "none"
 
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
@@ -576,6 +638,9 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        early_exit_hidden_mode=args.early_exit_hidden_mode,
+        early_exit_available_hidden_count=args.early_exit_available_hidden_count,
+        early_exit_prefill_mask_mode=args.early_exit_prefill_mask_mode,
     )
 
     dflash_model = FSDP(
