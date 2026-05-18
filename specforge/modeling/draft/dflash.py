@@ -165,6 +165,8 @@ class Qwen3DFlashAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        if isinstance(attention_mask, dict):
+            attention_mask = attention_mask.get(self.sliding_window, attention_mask[None])
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]

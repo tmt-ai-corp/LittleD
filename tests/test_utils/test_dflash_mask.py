@@ -5,7 +5,9 @@ import torch
 from specforge.core.dflash import create_dflash_block_mask, create_dflash_sdpa_mask
 
 
-def _reference_dflash_mask(anchor_positions, block_keep_mask, S, block_size, device):
+def _reference_dflash_mask(
+    anchor_positions, block_keep_mask, S, block_size, device, sliding_window=None
+):
     """Element-level reference mask mirroring the mask_mod inside create_dflash_block_mask.
 
     This uses plain Python loops so correctness is obvious by inspection.
@@ -18,13 +20,17 @@ def _reference_dflash_mask(anchor_positions, block_keep_mask, S, block_size, dev
     for b in range(B):
         for q_idx in range(Q_LEN):
             q_block_id = q_idx // block_size
+            q_offset = q_idx % block_size
             anchor_pos = anchor_positions[b, q_block_id].item()
+            q_pos = anchor_pos + q_offset
             is_valid = block_keep_mask[b, q_block_id].item()
             if not is_valid:
                 continue
             for kv_idx in range(KV_LEN):
                 is_context = kv_idx < S
                 ctx_visible = is_context and (kv_idx < anchor_pos)
+                if sliding_window is not None:
+                    ctx_visible = ctx_visible and (kv_idx > q_pos - sliding_window)
 
                 is_draft = kv_idx >= S
                 kv_block_id = (kv_idx - S) // block_size
@@ -41,7 +47,9 @@ class TestDFlashMask(unittest.TestCase):
         torch.manual_seed(42)
         self.device = torch.device("cuda")
 
-    def _compare_masks(self, anchor_positions, block_keep_mask, S, block_size):
+    def _compare_masks(
+        self, anchor_positions, block_keep_mask, S, block_size, sliding_window=None
+    ):
         """Compare create_dflash_sdpa_mask against element-level reference (ground truth)."""
         anchor_positions = anchor_positions.to(self.device)
         block_keep_mask = block_keep_mask.to(self.device)
@@ -52,6 +60,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -60,6 +69,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         self.assertEqual(
@@ -75,7 +85,7 @@ class TestDFlashMask(unittest.TestCase):
         )
 
     def _compare_block_mask_consistency(
-        self, anchor_positions, block_keep_mask, S, block_size
+        self, anchor_positions, block_keep_mask, S, block_size, sliding_window=None
     ):
         """Verify create_dflash_block_mask block-level mask is consistent with reference."""
         anchor_positions = anchor_positions.to(self.device)
@@ -87,6 +97,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         ref_mask = _reference_dflash_mask(
@@ -95,6 +106,7 @@ class TestDFlashMask(unittest.TestCase):
             S=S,
             block_size=block_size,
             device=self.device,
+            sliding_window=sliding_window,
         )
 
         dense_blocks = block_mask.to_dense()  # (B, H, Q_blocks, KV_blocks)
@@ -217,6 +229,25 @@ class TestDFlashMask(unittest.TestCase):
         anchor_positions = torch.tensor([[0, 1, 2, 3]])
         block_keep_mask = torch.tensor([[True, True, True, True]])
         self._compare_masks(anchor_positions, block_keep_mask, S=64, block_size=4)
+
+    def test_sliding_window_masks_context_only(self):
+        """Sliding window limits context while preserving same-block draft attention."""
+        anchor_positions = torch.tensor([[8, 16]])
+        block_keep_mask = torch.tensor([[True, True]])
+        self._compare_masks(
+            anchor_positions,
+            block_keep_mask,
+            S=32,
+            block_size=4,
+            sliding_window=5,
+        )
+        self._compare_block_mask_consistency(
+            anchor_positions,
+            block_keep_mask,
+            S=32,
+            block_size=4,
+            sliding_window=5,
+        )
 
     def test_random_stress(self):
         """Randomized stress test with multiple random configurations."""

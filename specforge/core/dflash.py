@@ -20,7 +20,14 @@ except ImportError:
     create_block_mask = None
 
 
-def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
+def create_dflash_sdpa_mask(
+    anchor_positions,
+    block_keep_mask,
+    S,
+    block_size,
+    device,
+    sliding_window: Optional[int] = None,
+):
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -31,12 +38,16 @@ def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, de
     )  # (1, 1, 1, KV_LEN)
 
     q_block_ids = q_indices // block_size
+    q_offsets = q_indices % block_size
 
     anchor_expanded = anchor_positions.view(B, 1, N, 1).repeat_interleave(
         block_size, dim=2
     )
 
     mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    if sliding_window is not None:
+        q_positions = anchor_expanded + q_offsets
+        mask_context = mask_context & (kv_indices > q_positions - sliding_window)
 
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
@@ -54,6 +65,7 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    sliding_window: Optional[int] = None,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -62,6 +74,7 @@ def create_dflash_block_mask(
 
     Rules:
       1. Each block sees context strictly before its anchor (kv_idx < anchor_pos).
+         Sliding layers additionally keep only the configured local window.
       2. Intra-block attention is bidirectional.
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
@@ -69,6 +82,7 @@ def create_dflash_block_mask(
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
+        q_offset = q_idx % block_size
         safe_q_block_id = q_block_id.clamp(max=N - 1)
         anchor_pos = anchor_positions[b, safe_q_block_id]
 
@@ -76,6 +90,9 @@ def create_dflash_block_mask(
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
         mask_context = is_context & (kv_idx < anchor_pos)
+        if sliding_window is not None:
+            q_pos = anchor_pos + q_offset
+            mask_context = mask_context & (kv_idx > q_pos - sliding_window)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
@@ -100,7 +117,7 @@ class DFlashTrainingView:
     block_keep_mask: torch.Tensor
     noise_embedding: torch.Tensor
     position_ids: torch.Tensor
-    attention_mask: torch.Tensor
+    attention_mask: object
     target_ids: torch.Tensor
     weight_mask: torch.Tensor
 
@@ -134,6 +151,15 @@ class OnlineDFlashModel(nn.Module):
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+    def _get_draft_sliding_windows(self) -> tuple[int, ...]:
+        windows: set[int] = set()
+        for layer in getattr(self.draft_model, "layers", []):
+            self_attn = getattr(layer, "self_attn", None)
+            sliding_window = getattr(self_attn, "sliding_window", None)
+            if sliding_window is not None:
+                windows.add(int(sliding_window))
+        return tuple(sorted(windows))
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -314,6 +340,18 @@ class OnlineDFlashModel(nn.Module):
                 block_size=self.block_size,
                 device=device,
             )
+            sliding_windows = self._get_draft_sliding_windows()
+            if sliding_windows:
+                dflash_attn_mask = {None: dflash_attn_mask}
+                for sliding_window in sliding_windows:
+                    dflash_attn_mask[sliding_window] = create_dflash_block_mask(
+                        anchor_positions=anchor_positions,
+                        block_keep_mask=block_keep_mask,
+                        S=seq_len,
+                        block_size=self.block_size,
+                        device=device,
+                        sliding_window=sliding_window,
+                    )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
                 anchor_positions=anchor_positions,
