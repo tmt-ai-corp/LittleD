@@ -547,6 +547,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        # When enabled, the draft model owns its own lm_head (quantized and
+        # checkpointed). Otherwise it shares the target model's lm_head.
+        self.draft_lm_head = bool(getattr(config, "draft_lm_head", False))
+        if self.draft_lm_head:
+            self.lm_head = nn.Linear(
+                config.hidden_size, config.vocab_size, bias=False
+            )
         self.post_init()
 
     def forward(
@@ -610,6 +617,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )
 
         self.eval()
+        lm_head = self.lm_head if self.draft_lm_head else target.lm_head
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
@@ -653,7 +661,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
+            draft_logits = lm_head(
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
@@ -755,6 +763,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         tree_budget: int = 32,
     ):
         self.eval()
+        lm_head = self.lm_head if self.draft_lm_head else target.lm_head
         block_size = self.block_size
         if block_size <= 1:
             return self.spec_generate(
@@ -844,7 +853,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
             stage_start = time.perf_counter()
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
+            draft_logits = lm_head(
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,

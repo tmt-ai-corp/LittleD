@@ -60,7 +60,8 @@ def apply_littlebit_patch(
     do_train: bool,
     exclude_names: list[str] | None = None,
 ):
-    exclude_names = exclude_names or ["lm_head"]
+    if exclude_names is None:
+        exclude_names = ["lm_head"]
     quant_func = load_quant_fn(getattr(quant_args, "quant_func", "STEBinary"))
     quant_mod = load_quant_module(
         getattr(quant_args, "quant_mod", "LittleBitLinear")
@@ -201,6 +202,7 @@ def _quant_config_dict(quant_args) -> dict:
         "kv_factor": getattr(quant_args, "kv_factor", 1.0),
         "min_split_dim": getattr(quant_args, "min_split_dim", 8),
         "group_size": getattr(quant_args, "group_size", 128),
+        "draft_lm_head": getattr(quant_args, "draft_lm_head", False),
     }
 
 
@@ -272,7 +274,11 @@ def load_quantized_dflash_model(
         quant_args = argparse.Namespace(**config_dict)
 
     model = DFlashDraftModel(config)
-    model = apply_littlebit_patch(model, quant_args, do_train=do_train)
+    # If the draft model owns its own lm_head, it must be quantized too.
+    exclude_names = [] if getattr(config, "draft_lm_head", False) else ["lm_head"]
+    model = apply_littlebit_patch(
+        model, quant_args, do_train=do_train, exclude_names=exclude_names
+    )
 
     state_dict, was_packed = _load_and_process_state_dict(model_path, torch_dtype)
     missing, unexpected = _load_state_dict_allow_meta(

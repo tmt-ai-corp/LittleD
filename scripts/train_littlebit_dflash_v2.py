@@ -87,6 +87,15 @@ def parse_args():
     model_group.add_argument("--embedding-key", type=str, default=None)
     model_group.add_argument("--lm-head-key", type=str, default=None)
     model_group.add_argument("--trust-remote-code", action="store_true")
+    model_group.add_argument(
+        "--draft-lm-head",
+        action="store_true",
+        help=(
+            "Give the draft model its own LittleBit-quantized lm_head "
+            "(initialized from the target lm_head and saved into the checkpoint). "
+            "When omitted, the draft shares the target model's lm_head as before."
+        ),
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -298,9 +307,34 @@ class StepTimer:
         self.start_time = None
 
 
+def attach_draft_lm_head(student_model, target_components):
+    """Give the draft model its own lm_head, initialized from the target lm_head.
+
+    This must run before apply_littlebit_patch so the lm_head is quantized from
+    the target weights instead of a random init.
+    """
+    target_weight = target_components.lm_head.weight
+    config = student_model.config
+    lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    if tuple(lm_head.weight.shape) != tuple(target_weight.shape):
+        raise ValueError(
+            f"Draft lm_head shape {tuple(lm_head.weight.shape)} does not match "
+            f"target lm_head shape {tuple(target_weight.shape)}."
+        )
+    device = next(student_model.parameters()).device
+    lm_head = lm_head.to(device=device, dtype=target_weight.dtype)
+    with torch.no_grad():
+        lm_head.weight.copy_(target_weight.to(device=device))
+    student_model.lm_head = lm_head
+    student_model.draft_lm_head = True
+    student_model.config.draft_lm_head = True
+    print_on_rank0("Attached draft lm_head initialized from target lm_head weights.")
+
+
 def build_models(
     args,
     resume_checkpoint: Optional[str],
+    target_components,
 ) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     target_model_kwargs = {}
     if args.target_model_backend == "sglang":
@@ -332,7 +366,12 @@ def build_models(
             torch_dtype=torch.bfloat16,
             trust_remote_code=args.trust_remote_code,
         ).cuda()
-        student_model = apply_littlebit_patch(student_model, args, do_train=True)
+        if args.draft_lm_head:
+            attach_draft_lm_head(student_model, target_components)
+        exclude_names = [] if args.draft_lm_head else ["lm_head"]
+        student_model = apply_littlebit_patch(
+            student_model, args, do_train=True, exclude_names=exclude_names
+        )
         student_model = move_model_to_local_cuda(student_model)
 
     student_model.config._attn_implementation = args.attention_backend
@@ -361,9 +400,15 @@ def save_checkpoint(args, epoch: int, step: int, student_model, optimizer):
 
 def build_dflash_helper(args, student_model, target_components, mask_token_id):
     student_unwrapped = unwrap_model(student_model)
+    use_draft_lm_head = bool(getattr(student_unwrapped, "draft_lm_head", False))
+    lm_head = (
+        student_unwrapped.lm_head
+        if use_draft_lm_head
+        else target_components.lm_head
+    )
     return OnlineDFlashModel(
         draft_model=student_unwrapped,
-        target_lm_head=target_components.lm_head,
+        target_lm_head=lm_head,
         target_embed_tokens=target_components.embed_tokens,
         block_size=student_unwrapped.block_size,
         mask_token_id=mask_token_id,
@@ -492,7 +537,16 @@ def main():
         print_on_rank0(f"Resuming from checkpoint: {resume_checkpoint}")
 
     try:
-        target_model, student_model = build_models(args, resume_checkpoint)
+        target_components = TargetEmbeddingsAndHead.from_pretrained(
+            args.target_model_path,
+            embed_key=args.embedding_key,
+            lm_head_key=args.lm_head_key,
+            device="cuda",
+            trust_remote_code=args.trust_remote_code,
+        )
+        target_model, student_model = build_models(
+            args, resume_checkpoint, target_components
+        )
 
         if dist.get_world_size() > 1:
             student_model = DDP(
@@ -541,13 +595,6 @@ def main():
             total_steps = min(total_steps, args.max_num_steps)
         print_on_rank0(f"Total training steps: {total_steps}")
 
-        target_components = TargetEmbeddingsAndHead.from_pretrained(
-            args.target_model_path,
-            embed_key=args.embedding_key,
-            lm_head_key=args.lm_head_key,
-            device="cuda",
-            trust_remote_code=args.trust_remote_code,
-        )
         dflash_helper = build_dflash_helper(
             args, student_model, target_components, mask_token_id
         )
