@@ -563,6 +563,39 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = dflash_config.get("mask_token_id", None)
+        self.draft_lm_head = bool(getattr(config, "draft_lm_head", False))
+        self.draft_lm_head_pruning = getattr(config, "draft_lm_head_pruning", None)
+        if self.draft_lm_head:
+            draft_lm_head_vocab_size = int(
+                getattr(
+                    config,
+                    "draft_lm_head_vocab_size",
+                    self.draft_lm_head_pruning or config.vocab_size,
+                )
+            )
+            self.lm_head = nn.Linear(
+                config.hidden_size,
+                draft_lm_head_vocab_size,
+                bias=False,
+            )
+            if self.draft_lm_head_pruning is not None:
+                target_vocab_size = int(config.vocab_size)
+                self.register_buffer(
+                    "t2d",
+                    torch.zeros(target_vocab_size, dtype=torch.bool),
+                )
+                self.register_buffer(
+                    "d2t",
+                    torch.zeros(draft_lm_head_vocab_size, dtype=torch.long),
+                )
+                self.register_buffer(
+                    "draft_to_target",
+                    torch.zeros(draft_lm_head_vocab_size, dtype=torch.long),
+                )
+                self.register_buffer(
+                    "target_to_draft",
+                    torch.full((target_vocab_size,), -1, dtype=torch.long),
+                )
         if self.early_exit_hidden_mode == "add_embed" and num_early_exit_missing > 0:
             self.early_exit_hidden_embed = nn.Parameter(
                 torch.zeros(num_early_exit_missing, config.hidden_size)
@@ -612,6 +645,40 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             all_hidden_states.append(hidden_states)
             return hidden_states, tuple(all_hidden_states)
         return hidden_states
+
+    def compute_draft_logits(self, target: nn.Module, hidden_states: torch.Tensor):
+        if getattr(self, "draft_lm_head", False) and hasattr(self, "lm_head"):
+            return self.lm_head(hidden_states)
+        return target.lm_head(hidden_states)
+
+    def map_draft_token_ids_to_target(
+        self,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        draft_to_target = getattr(self, "draft_to_target", None)
+        if draft_to_target is None:
+            return token_ids
+        draft_to_target = draft_to_target.to(device=token_ids.device)
+        safe_token_ids = token_ids.clamp(min=0, max=draft_to_target.numel() - 1)
+        return draft_to_target[safe_token_ids]
+
+    def map_draft_child_maps_to_target(
+        self,
+        child_maps: list[dict[int, int]],
+    ) -> list[dict[int, int]]:
+        draft_to_target = getattr(self, "draft_to_target", None)
+        if draft_to_target is None:
+            return child_maps
+        mapping = draft_to_target.to(device="cpu")
+        mapped_child_maps = []
+        for child_map in child_maps:
+            mapped_child_maps.append(
+                {
+                    int(mapping[int(token_id)].item()): child_index
+                    for token_id, child_index in child_map.items()
+                }
+            )
+        return mapped_child_maps
 
     @torch.inference_mode()
     def spec_generate(
@@ -682,7 +749,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
+            draft_logits = self.compute_draft_logits(
+                target,
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
@@ -695,7 +763,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 )[:, -block_size + 1 :, :]
             )
             past_key_values_draft.crop(start)
-            block_output_ids[:, 1:] = sample(draft_logits)
+            block_output_ids[:, 1:] = self.map_draft_token_ids_to_target(
+                sample(draft_logits)
+            )
 
             output = target(
                 block_output_ids,
@@ -873,7 +943,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
             stage_start = time.perf_counter()
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            draft_logits = target.lm_head(
+            draft_logits = self.compute_draft_logits(
+                target,
                 self(
                     target_hidden=target_hidden,
                     noise_embedding=noise_embedding,
@@ -896,6 +967,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 child_maps,
                 visibility_cpu,
             ) = build_ddtree_tree(draft_logits[0], tree_budget)
+            node_token_ids = self.map_draft_token_ids_to_target(node_token_ids)
+            child_maps = self.map_draft_child_maps_to_target(child_maps)
             ddtree_stage_times["tree_build"] += time.perf_counter() - stage_start
 
             stage_start = time.perf_counter()

@@ -59,12 +59,11 @@ def apply_littlebit_patch(
     *,
     do_train: bool,
     exclude_names: list[str] | None = None,
+    lm_head_kwargs: dict | None = None,
 ):
     exclude_names = exclude_names or ["lm_head"]
     quant_func = load_quant_fn(getattr(quant_args, "quant_func", "STEBinary"))
-    quant_mod = load_quant_module(
-        getattr(quant_args, "quant_mod", "LittleBitLinear")
-    )
+    quant_mod = load_quant_module(getattr(quant_args, "quant_mod", "LittleBitLinear"))
     common_kwargs = {
         "do_train": do_train,
         "quant_func": quant_func,
@@ -78,6 +77,7 @@ def apply_littlebit_patch(
         "ratio_factor": getattr(quant_args, "kv_factor", 1.0),
     }
     kv_patterns = [re.compile(r"\.k_proj$"), re.compile(r"\.v_proj$")]
+    lm_head_kwargs = lm_head_kwargs or {}
 
     for name, module in model.named_modules():
         if any(excluded in name for excluded in exclude_names):
@@ -86,10 +86,44 @@ def apply_littlebit_patch(
             continue
 
         current_kwargs = dict(common_kwargs)
+        current_quant_mod = quant_mod
         if any(pattern.search(name) for pattern in kv_patterns):
             current_kwargs.update(kv_kwargs)
+        if name == "lm_head" and lm_head_kwargs:
+            current_kwargs.update(
+                {
+                    "quant_func": load_quant_fn(
+                        lm_head_kwargs.get(
+                            "quant_func",
+                            getattr(quant_args, "quant_func", "STEBinary"),
+                        )
+                    ),
+                    "residual": lm_head_kwargs.get(
+                        "residual", getattr(quant_args, "residual", False)
+                    ),
+                    "split_dim": lm_head_kwargs.get(
+                        "split_dim", getattr(quant_args, "split_dim", 1024)
+                    ),
+                    "eff_bit": lm_head_kwargs.get(
+                        "eff_bit", getattr(quant_args, "eff_bit", 1.0)
+                    ),
+                    "min_split_dim": lm_head_kwargs.get(
+                        "min_split_dim",
+                        getattr(quant_args, "min_split_dim", 8),
+                    ),
+                    "group_size": lm_head_kwargs.get(
+                        "group_size", getattr(quant_args, "group_size", 128)
+                    ),
+                }
+            )
+            current_quant_mod = load_quant_module(
+                lm_head_kwargs.get(
+                    "quant_mod",
+                    getattr(quant_args, "quant_mod", "LittleBitLinear"),
+                )
+            )
 
-        module.__class__ = quant_mod
+        module.__class__ = current_quant_mod
         module.__quant_convert__(**current_kwargs)
 
     return model
@@ -192,7 +226,7 @@ def read_littlebit_config(model_path: str) -> dict:
 
 
 def _quant_config_dict(quant_args) -> dict:
-    return {
+    config = {
         "quant_mod": getattr(quant_args, "quant_mod", "LittleBitLinear"),
         "quant_func": getattr(quant_args, "quant_func", "STEBinary"),
         "eff_bit": getattr(quant_args, "eff_bit", 1.0),
@@ -201,6 +235,52 @@ def _quant_config_dict(quant_args) -> dict:
         "kv_factor": getattr(quant_args, "kv_factor", 1.0),
         "min_split_dim": getattr(quant_args, "min_split_dim", 8),
         "group_size": getattr(quant_args, "group_size", 128),
+    }
+    optional_keys = [
+        "draft_lm_head",
+        "draft_lm_head_pruning",
+        "draft_lm_head_vocab_size",
+        "lm_head_eff_bit",
+        "lm_head_split_dim",
+        "lm_head_residual",
+        "lm_head_group_size",
+        "lm_head_quant_func",
+        "lm_head_quant_mod",
+        "lm_head_min_split_dim",
+    ]
+    for key in optional_keys:
+        if hasattr(quant_args, key):
+            config[key] = getattr(quant_args, key)
+    return config
+
+
+def _lm_head_quant_kwargs_from_args(quant_args) -> dict | None:
+    if not getattr(quant_args, "draft_lm_head", False):
+        return None
+    def _fallback(name, fallback):
+        value = getattr(quant_args, name, None)
+        return fallback if value is None else value
+
+    return {
+        "eff_bit": _fallback("lm_head_eff_bit", getattr(quant_args, "eff_bit", 1.0)),
+        "split_dim": _fallback(
+            "lm_head_split_dim", getattr(quant_args, "split_dim", 1024)
+        ),
+        "residual": _fallback(
+            "lm_head_residual", getattr(quant_args, "residual", False)
+        ),
+        "group_size": _fallback(
+            "lm_head_group_size", getattr(quant_args, "group_size", 128)
+        ),
+        "quant_func": _fallback(
+            "lm_head_quant_func", getattr(quant_args, "quant_func", "STEBinary")
+        ),
+        "quant_mod": _fallback(
+            "lm_head_quant_mod", getattr(quant_args, "quant_mod", "LittleBitLinear")
+        ),
+        "min_split_dim": _fallback(
+            "lm_head_min_split_dim", getattr(quant_args, "min_split_dim", 8)
+        ),
     }
 
 
@@ -272,7 +352,14 @@ def load_quantized_dflash_model(
         quant_args = argparse.Namespace(**config_dict)
 
     model = DFlashDraftModel(config)
-    model = apply_littlebit_patch(model, quant_args, do_train=do_train)
+    exclude_names = [] if getattr(quant_args, "draft_lm_head", False) else ["lm_head"]
+    model = apply_littlebit_patch(
+        model,
+        quant_args,
+        do_train=do_train,
+        exclude_names=exclude_names,
+        lm_head_kwargs=_lm_head_quant_kwargs_from_args(quant_args),
+    )
 
     state_dict, was_packed = _load_and_process_state_dict(model_path, torch_dtype)
     missing, unexpected = _load_state_dict_allow_meta(

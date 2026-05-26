@@ -495,8 +495,6 @@ class OnlineDFlashModel(nn.Module):
         total_correct = output_hidden.new_zeros(())
         flat_targets = training_view.target_ids.reshape(output_hidden.shape[0], -1)
         flat_weights = training_view.weight_mask.reshape(output_hidden.shape[0], -1)
-        valid_token_count = flat_weights.sum() + 1e-6
-        actual_token_count = (flat_weights > 0.0).sum() + 1e-6
 
         seq_len = output_hidden.shape[1]
         if chunk_size is None or chunk_size <= 0:
@@ -508,6 +506,11 @@ class OnlineDFlashModel(nn.Module):
             flat_logits = logits.reshape(-1, logits.size(-1))
             target_chunk = flat_targets[:, start:end].reshape(-1)
             weight_chunk = flat_weights[:, start:end].reshape(-1)
+            target_chunk, weight_chunk = self._map_targets_for_lm_head(
+                target_chunk,
+                weight_chunk,
+                flat_logits.size(-1),
+            )
             loss_per_token = F.cross_entropy(
                 flat_logits, target_chunk, reduction="none"
             )
@@ -520,9 +523,49 @@ class OnlineDFlashModel(nn.Module):
                     (pred_ids == target_chunk) & binary_eval_mask
                 ).sum()
 
+        flat_weights = self._mask_weights_for_lm_head_targets(
+            flat_targets.reshape(-1),
+            flat_weights.reshape(-1),
+        ).reshape_as(flat_weights)
+        valid_token_count = flat_weights.sum() + 1e-6
+        actual_token_count = (flat_weights > 0.0).sum() + 1e-6
         loss = total_loss / valid_token_count
         accuracy = total_correct.float() / actual_token_count
         return loss, accuracy
+
+    def _map_targets_for_lm_head(
+        self,
+        target_ids: torch.Tensor,
+        weights: torch.Tensor,
+        logits_vocab_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        target_to_draft = getattr(self.draft_model, "target_to_draft", None)
+        if target_to_draft is None:
+            if target_ids.numel() > 0 and int(target_ids.max()) >= logits_vocab_size:
+                raise ValueError(
+                    "lm_head logits vocab is smaller than target ids, but no "
+                    "target_to_draft mapping is loaded."
+                )
+            return target_ids, weights
+
+        target_to_draft = target_to_draft.to(device=target_ids.device)
+        safe_target_ids = target_ids.clamp(min=0, max=target_to_draft.numel() - 1)
+        mapped_targets = target_to_draft[safe_target_ids]
+        valid_targets = mapped_targets >= 0
+        return mapped_targets.clamp_min(0), weights * valid_targets.to(weights.dtype)
+
+    def _mask_weights_for_lm_head_targets(
+        self,
+        target_ids: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        target_to_draft = getattr(self.draft_model, "target_to_draft", None)
+        if target_to_draft is None:
+            return weights
+        target_to_draft = target_to_draft.to(device=target_ids.device)
+        safe_target_ids = target_ids.clamp(min=0, max=target_to_draft.numel() - 1)
+        valid_targets = target_to_draft[safe_target_ids] >= 0
+        return weights * valid_targets.to(weights.dtype)
 
     def compute_loss_and_accuracy(
         self,
@@ -532,6 +575,11 @@ class OnlineDFlashModel(nn.Module):
         flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = training_view.target_ids.view(-1)
         flat_weights = training_view.weight_mask.view(-1)
+        flat_targets, flat_weights = self._map_targets_for_lm_head(
+            flat_targets,
+            flat_weights,
+            flat_logits.size(-1),
+        )
         binary_eval_mask = flat_weights > 0.0
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
